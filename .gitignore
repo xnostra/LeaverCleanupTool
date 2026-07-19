@@ -1,0 +1,17 @@
+# Runtime output - contains real names/accounts, never commit these
+Restore_*.json
+Log_*.log
+result_*.csv
+result_*.xlsx
+COMMITTED_*.csv
+COMMITTED_*.xlsx
+PurgeCandidates_*.csv
+~$*
+
+# Leaver lists / exports
+leavers.csv
+pupils.csv
+*.xlsx
+
+# Local config
+LeaverTool.json
