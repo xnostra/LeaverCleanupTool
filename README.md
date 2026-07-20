@@ -1,23 +1,45 @@
 # Microsoft 365 Leaver Cleanup Tool
 
-A menu-driven PowerShell tool for safely offboarding leavers (students or staff) from Microsoft 365. It disables accounts, removes group / distribution-list / Teams memberships, hides users from the address book, and removes licences — and for staff it preserves email (converts the mailbox to a free shared mailbox) and archives OneDrive files to SharePoint.
+A menu-driven PowerShell tool for safely offboarding leavers (students or staff) from Microsoft 365. It disables accounts, removes group/distribution-list/Teams memberships, hides users from the address book, and removes licences. For staff, it preserves email and archives OneDrive files to SharePoint.
 
-Built for schools/organisations that offboard people in batches (e.g. end of term/year), with heavy emphasis on **safety**: preview before commit, an undo file for every run, and automatic protection against touching the wrong accounts.
+Built for schools and organisations that offboard people in batches (e.g., end of term/year) with heavy emphasis on **safety**: dry-run preview, undo files for every run, and automatic protection against touching the wrong accounts.
+
+## Quick Start
+
+1. **Download**: Clone this repo or download the files
+2. **Run**: Double-click **`Leaver Cleanup Tool.bat`**
+3. **Sign in**: Use your Microsoft 365 Global Administrator account
+4. **Dry Run**: Preview changes and review the Excel report
+5. **Commit**: Once satisfied, commit the changes
+
+For command-line execution:
+```powershell
+.\Disable-RemoveLicenses.ps1 -CsvPath .\leavers.csv -SkipIfActiveWithinDays 60
+```
 
 ---
 
 ## Features
 
-- **Dry run first** — preview any bulk cleanup and get a colour-coded Excel report; nothing changes until you commit.
-- **Students vs. Staff modes** — student runs automatically refuse to touch anything that looks like a staff account; staff runs preserve email and archive OneDrive.
-- **Smart matching** — matches by email, then falls back to name (handles missing/old emails, word-order differences, middle names, spelling variants).
-- **Recycled-address protection** — detects when a leaver's old email now belongs to a *new* person (account created after they left, or a different name) and skips it.
-- **Recently-active + sign-in checks** — skips accounts used recently; flags sign-ins from outside your country or repeated failed logins.
-- **Hybrid aware** — detects accounts synced from on-premises Active Directory and tells you which steps must be done in local AD instead of the cloud.
-- **Undo** — every commit writes a `Restore_*.json`; the RESTORE menu puts any account back exactly as it was.
-- **Purge** — deletes accounts that have been disabled + unlicensed + inactive for years (shared mailboxes protected; deletions restorable for 30 days).
-- **Reports & logs** — formatted Excel report per run, plus a running monthly log.
-- **Self-installing** — installs the required modules on first run; drops its own admin rights if launched elevated.
+✅ **Dry Run First** — Preview bulk cleanup with colour-coded Excel reports; nothing changes until you commit
+
+✅ **Students vs. Staff Modes** — Student runs refuse to touch staff accounts; staff runs preserve email and archive OneDrive
+
+✅ **Smart Matching** — Matches by email, falls back to name; handles missing emails, word-order differences, middle names, and spelling variants
+
+✅ **Recycled-Address Protection** — Detects when a leaver's old email now belongs to a new person and skips it
+
+✅ **Activity & Sign-in Checks** — Skips recently-used accounts; flags suspicious sign-ins (outside your country, repeated failures)
+
+✅ **Hybrid Aware** — Detects on-premises AD synced accounts; tells you which steps must be done locally
+
+✅ **Undo Capability** — Every commit writes a `Restore_*.json` file; restore any account to its previous state
+
+✅ **Purge Function** — Safely deletes disabled, unlicensed, inactive accounts (shared mailboxes protected; 30-day restore window)
+
+✅ **Reports & Audit Logs** — Formatted Excel reports per run plus a running monthly log for compliance
+
+✅ **Self-Installing** — Installs required modules on first run; auto-detects and handles elevated windows
 
 ---
 
@@ -31,24 +53,30 @@ Built for schools/organisations that offboard people in batches (e.g. end of ter
 
 ---
 
-## Quick start
+## Setup & First Run
 
-1. Download the files (or clone the repo).
-2. *(Optional)* double-click **`Create Shortcut.bat`** to get a desktop shortcut with an icon.
-3. Double-click **`Leaver Cleanup Tool.bat`**.
-4. Sign in with your global admin account when prompted.
-5. Choose **DRY RUN**, pick your leaver list, review the Excel report, then **COMMIT**.
+1. **Download** the files (or clone the repo)
+2. *(Optional)* Double-click **`Create Shortcut.bat`** for a desktop shortcut with icon
+3. Double-click **`Leaver Cleanup Tool.bat`**
+4. Sign in with your Microsoft 365 Global Administrator account
+5. **DRY RUN** — Select your leaver list, review the Excel report
+6. **COMMIT** — Once satisfied, commit the changes
 
-### Leaver list format
+The tool installs required modules automatically on first run.
 
-Any CSV or Excel file. Column names are auto-detected. At minimum an **email** column; **name** and **leaving date** columns make the safety checks stronger.
+### Leaver List Format
 
-```
+Supports CSV or Excel files. Column names are auto-detected. At minimum: **email** column. Add **name** and **leaving date** for stronger safety checks.
+
+**CSV Example:**
+```csv
 Email,Name,LeavingDate
 jsmith@example.org,John Smith,2024-06-30
 ```
 
-iSAMS-style headers (`Pupil Email Address`, `Full Name`, `Leaving Date`) are also recognised automatically.
+**Supported Headers:**
+- Standard: `Email`, `Name`, `LeavingDate`
+- iSAMS-style: `Pupil Email Address`, `Full Name`, `Leaving Date`
 
 ---
 
