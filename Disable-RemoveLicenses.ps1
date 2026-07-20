@@ -69,9 +69,16 @@ if ($isAdmin -and -not $Relaunched) {
     }
 }
 
+# ---------- Build stamp (bump this every time you change the script) ----------
+# Format YYYYMMDDNN. The self-update only replaces the local file when the remote stamp is HIGHER,
+# so it can never downgrade to older code.
+$script:ToolBuildStamp = 2026072001
+
 # ---------- Self-update: always run the newest code from GitHub ----------
-# Works two ways: a git CLONE gets pulled (fast-forward only); a plain DOWNLOAD (no git) fetches the
-# latest script file directly from the PUBLIC repo and replaces itself. Fails safe if offline; skip with -NoSelfUpdate.
+# Works two ways: a git CLONE gets pulled (fast-forward only, which is already forward-only and safe);
+# a plain DOWNLOAD (no git) fetches the latest script from the PUBLIC repo and replaces itself ONLY IF
+# the remote build stamp is newer AND the download looks like a valid copy of this tool.
+# Fails safe if offline; skip with -NoSelfUpdate.
 $script:UpdateRawUrl = 'https://raw.githubusercontent.com/xnostra/LeaverCleanupTool-GitHub/main/Disable-RemoveLicenses.ps1'
 if (-not $NoSelfUpdate -and -not $Updated) {
     $relArg = if ($Relaunched) { ' -Relaunched' } else { '' }
@@ -102,16 +109,24 @@ if (-not $NoSelfUpdate -and -not $Updated) {
             }
         }
         else {
-            # --- Plain download (no git): fetch the latest script file from the public repo ---
+            # --- Plain download (no git): fetch the latest script from the public repo, with safety checks ---
             Write-Host "Checking for the latest version on GitHub..." -ForegroundColor Gray
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             $remote = (Invoke-WebRequest -Uri $script:UpdateRawUrl -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop).Content
-            if ($remote -and $remote.Length -gt 2000) {
-                $local = Get-Content -Raw -LiteralPath $PSCommandPath -ErrorAction Stop
-                if (($remote -replace "`r","") -ne ($local -replace "`r","")) {
-                    Set-Content -LiteralPath $PSCommandPath -Value $remote -Encoding UTF8
-                    & $restart; exit
-                }
+
+            # SAFETY 1: the download must actually look like this tool (not an error page or a truncated file)
+            $looksValid = $remote -and $remote.Length -gt 5000 -and
+                          $remote -match 'MICROSOFT 365 LEAVER CLEANUP TOOL' -and
+                          $remote -match 'ToolBuildStamp' -and
+                          $remote -match 'param\('
+            # SAFETY 2: only update when the remote build stamp is NEWER than ours (never downgrade)
+            $remoteStamp = 0
+            if ($remote -match "ToolBuildStamp\s*=\s*(\d+)") { $remoteStamp = [long]$Matches[1] }
+
+            if ($looksValid -and $remoteStamp -gt $script:ToolBuildStamp) {
+                Write-Host "A newer version is available (build $remoteStamp > $($script:ToolBuildStamp))." -ForegroundColor Gray
+                Set-Content -LiteralPath $PSCommandPath -Value $remote -Encoding UTF8
+                & $restart; exit
             }
         }
     } catch { Pop-Location -ErrorAction SilentlyContinue }
