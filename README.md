@@ -6,6 +6,16 @@ Built for schools and organisations that offboard people in batches (e.g., end o
 
 ## Quick Start
 
+**Option A — One-liner (installs to `Desktop\LeaverCleanupTool` and launches):**
+
+```powershell
+irm https://raw.githubusercontent.com/xnostra/LeaverCleanupTool/main/invoke-leaver.ps1 | iex
+```
+
+> Run this in a **normal (non-admin)** PowerShell window. The tool installs itself into a permanent folder on your Desktop so your undo files, logs, and config persist between runs. Re-running the one-liner updates the tool in place.
+
+**Option B — Manual:**
+
 1. **Download**: Clone this repo or download the files
 2. **Run**: Double-click **`Leaver Cleanup Tool.bat`**
 3. **Sign in**: Use your Microsoft 365 Global Administrator account
