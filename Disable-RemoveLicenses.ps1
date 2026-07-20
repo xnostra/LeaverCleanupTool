@@ -78,12 +78,32 @@ function Write-Log {
 }
 Write-Log "=== Tool started (v$($script:ToolVersion)) by $([Security.Principal.WindowsIdentity]::GetCurrent().Name) ==="
 
+# ---------- Local settings (LeaverTool.local.json, kept next to the script, NOT committed to GitHub) ----------
+# This file holds YOUR organisation-specific values so the script itself can stay generic/shareable.
+$script:cfgFile = Join-Path $PSScriptRoot 'LeaverTool.local.json'
+$script:cfg = @{ OrgName = 'Your Organisation'; ArchiveSiteUrl = ''; SafeCountries = @('QA') }
+if (Test-Path $script:cfgFile) {
+    try {
+        $saved = Get-Content $script:cfgFile -Raw | ConvertFrom-Json
+        if ($saved.OrgName)        { $script:cfg.OrgName = $saved.OrgName }
+        if ($saved.ArchiveSiteUrl) { $script:cfg.ArchiveSiteUrl = $saved.ArchiveSiteUrl }
+        if ($saved.SafeCountries)  { $script:cfg.SafeCountries = @($saved.SafeCountries) }
+    } catch { }
+}
+if ($ArchiveSiteUrl) { $script:cfg.ArchiveSiteUrl = $ArchiveSiteUrl }
+# command-line -SafeCountries overrides the saved one
+if ($PSBoundParameters.ContainsKey('SafeCountries')) { $script:cfg.SafeCountries = $SafeCountries } else { $SafeCountries = $script:cfg.SafeCountries }
+function Save-Config { try { $script:cfg | ConvertTo-Json | Set-Content $script:cfgFile } catch { } }
+
 # ---------- Professional banner ----------
 Clear-Host
+$orgLine = ("{0}  -  IT Department" -f $script:cfg.OrgName)
+$pad = [int]((50 - $orgLine.Length) / 2); if ($pad -lt 1) { $pad = 1 }
+$orgCentered = (' ' * $pad) + $orgLine
 Write-Host ""
 Write-Host "   +==================================================+" -ForegroundColor Cyan
 Write-Host "   |        MICROSOFT 365 LEAVER CLEANUP TOOL         |" -ForegroundColor Cyan
-Write-Host "   |        Your Organisation  -  IT Department         |" -ForegroundColor Cyan
+Write-Host ("   |{0,-50}|" -f $orgCentered) -ForegroundColor Cyan
 Write-Host "   |                    version $($script:ToolVersion)                    |" -ForegroundColor Cyan
 Write-Host "   +==================================================+" -ForegroundColor Cyan
 Write-Host ""
@@ -120,17 +140,6 @@ Connect-MgGraph -Scopes "User.ReadWrite.All","Organization.Read.All","AuditLog.R
 Write-Progress -Activity "Starting up" -Status "Ready" -PercentComplete 100 -Completed
 Write-Host "Signed in. Opening the menu..." -ForegroundColor Green
 
-# Remembered settings (archive site URL etc.)
-$script:cfgFile = Join-Path $env:APPDATA 'LeaverTool.json'
-$script:cfg = @{ ArchiveSiteUrl = '' }
-if (Test-Path $script:cfgFile) {
-    try {
-        $saved = Get-Content $script:cfgFile -Raw | ConvertFrom-Json
-        if ($saved.ArchiveSiteUrl) { $script:cfg.ArchiveSiteUrl = $saved.ArchiveSiteUrl }
-    } catch { }
-}
-if ($ArchiveSiteUrl) { $script:cfg.ArchiveSiteUrl = $ArchiveSiteUrl }
-function Save-Config { try { $script:cfg | ConvertTo-Json | Set-Content $script:cfgFile } catch { } }
 $activeCutoff = (Get-Date).ToUniversalTime().AddDays(-$SkipIfActiveWithinDays)
 
 $script:exoConnected = $false

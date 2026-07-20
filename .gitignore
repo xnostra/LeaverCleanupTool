@@ -13,5 +13,6 @@ leavers.csv
 pupils.csv
 *.xlsx
 
-# Local config
+# Local config - holds YOUR organisation's real values, never publish this
 LeaverTool.json
+LeaverTool.local.json
