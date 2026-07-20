@@ -940,6 +940,7 @@ function Start-BulkMode {
 
     $results = New-Object System.Collections.Generic.List[object]
     $reviewList = New-Object System.Collections.Generic.List[object]
+    $toProcess  = New-Object System.Collections.Generic.List[object]
     $i = 0
 
     foreach ($row in $rows) {
@@ -1023,7 +1024,7 @@ function Start-BulkMode {
             if ($u.JobTitle) { $why += "job title '$($u.JobTitle)'" }
             if ($u.Department) { $why += "department '$($u.Department)'" }
             $results.Add((New-Result $key $name $u.UserPrincipalName $dn $left $u.CreatedDateTime $seen 'REVIEW - looks like STAFF' "This is a STUDENT run but the account looks like a staff member ($($why -join ', ')). Not touched - if they really are staff, run them through a Staff run instead." $lics))
-            if ($DoCommit) { $reviewList.Add(@{ Idx = $results.Count - 1; User = $u; Key = $key; Name = $name; Left = $left; Seen = $seen; Lics = $lics; Sec = $sec }) }
+            if ($DoCommit) { $reviewList.Add(@{ Idx = $results.Count - 1; User = $u; Key = $key; Name = $name; Left = $left; Seen = $seen; Lics = $lics; Sec = $sec; Inactive = $inactiveTxt }) }
             continue
         }
         if ($script:ListType -eq 'Staff' -and -not $looksStaff) {
@@ -1049,7 +1050,7 @@ function Start-BulkMode {
         # ---- FAILSAFE: name cross-check ----
         if ($name -and $email -and -not $sameName) {
             $results.Add((New-Result $key $name $u.UserPrincipalName $dn $left $u.CreatedDateTime $seen 'REVIEW - name mismatch' "Your list says '$name' but the account is named '$dn' - names genuinely differ. Not touched - check if same person, handle manually." $lics))
-            if ($DoCommit) { $reviewList.Add(@{ Idx = $results.Count - 1; User = $u; Key = $key; Name = $name; Left = $left; Seen = $seen; Lics = $lics; Sec = $sec }) }
+            if ($DoCommit) { $reviewList.Add(@{ Idx = $results.Count - 1; User = $u; Key = $key; Name = $name; Left = $left; Seen = $seen; Lics = $lics; Sec = $sec; Inactive = $inactiveTxt }) }
             continue
         }
 
@@ -1061,7 +1062,13 @@ function Start-BulkMode {
         # ---- FAILSAFE: recently active ----
         if ($SkipIfActiveWithinDays -gt 0 -and $lastSignIn -and $lastSignIn -gt $activeCutoff) {
             $results.Add((New-Result $key $name $u.UserPrincipalName $dn $left $u.CreatedDateTime $seen 'SKIP - recently active' "Account name is '$dn'. Someone signed in within the last $SkipIfActiveWithinDays days (last: $seen). Might still be in use - not touched. Check manually if they really left." $lics -SignInCheck $sec))
-            if ($DoCommit) { $reviewList.Add(@{ Idx = $results.Count - 1; User = $u; Key = $key; Name = $name; Left = $left; Seen = $seen; Lics = $lics; Sec = $sec }) }
+            if ($DoCommit) { $reviewList.Add(@{ Idx = $results.Count - 1; User = $u; Key = $key; Name = $name; Left = $left; Seen = $seen; Lics = $lics; Sec = $sec; Inactive = $inactiveTxt }) }
+            continue
+        }
+
+        # ---- FAST-SKIP: already disabled AND no licence = already done, nothing to do (saves time) ----
+        if (-not $u.AccountEnabled -and $skus.Count -eq 0) {
+            $results.Add((New-Result $key $name $u.UserPrincipalName $dn $left $u.CreatedDateTime $seen 'ALREADY DONE' "Account is already disabled and has no licence - nothing to do, skipped for speed.$note" $lics -SignInCheck $sec))
             continue
         }
 
@@ -1070,17 +1077,9 @@ function Start-BulkMode {
             continue
         }
 
-        try {
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            Write-Host "`nProcessing $key ($dn):" -ForegroundColor White
-            $r = Invoke-AccountCleanup -User $u -DoGroups (-not $NoGroupCleanup) -DoHide (-not $NoHideFromAddressBook) -ConvertToShared ([bool]$script:StaffMode) -Delegate "$script:DelegateEmail" -ArchiveUrl $(if ($script:StaffMode) { $script:cfg.ArchiveSiteUrl } else { '' })
-            Write-Host "  -> done in $([int]$sw.Elapsed.TotalSeconds)s" -ForegroundColor Green
-            $results.Add((New-Result $key $name $u.UserPrincipalName $dn $left $u.CreatedDateTime $seen 'DONE' "$r ($inactiveTxt)." $lics -SignInCheck $sec))
-        }
-        catch {
-            Write-Host " FAILED" -ForegroundColor Red
-            $results.Add((New-Result $key $name $u.UserPrincipalName $dn $left $u.CreatedDateTime $seen 'ERROR' "Failed: $($_.Exception.Message)" $lics -SignInCheck $sec))
-        }
+        # COMMIT: don't act yet - queue it. Nothing is disabled until after you've decided the borderline cases.
+        $results.Add((New-Result $key $name $u.UserPrincipalName $dn $left $u.CreatedDateTime $seen 'QUEUED' "Passed all checks - queued for cleanup.$note" $lics -SignInCheck $sec))
+        $toProcess.Add(@{ Idx = $results.Count - 1; User = $u; Key = $key; Name = $name; Left = $left; Seen = $seen; Lics = $lics; Sec = $sec; Inactive = $inactiveTxt; FromReview = $false })
     }
 
     # ---- Clean up old result files, then save ----
@@ -1091,47 +1090,65 @@ function Start-BulkMode {
 
     Write-Progress -Activity "Checking your list against Microsoft 365" -Completed
 
-    # ---- Offer to review the skipped accounts one by one (commit runs only) ----
-    if ($DoCommit -and $reviewList.Count -gt 0) {
-        # Helper that cleans up one reviewed account and updates its result row
-        $doOne = {
+    # ================= COMMIT: decide borderline cases FIRST, then do all the work =================
+    if ($DoCommit) {
+        # Adds a reviewed account to the processing queue (marks its row as queued-from-review)
+        $approve = {
             param($c)
-            try {
-                Write-Host "`nProcessing $($c.Key) ($($c.User.DisplayName)) [approved from review]:" -ForegroundColor White
-                $r = Invoke-AccountCleanup -User $c.User -DoGroups (-not $NoGroupCleanup) -DoHide (-not $NoHideFromAddressBook) -ConvertToShared ([bool]$script:StaffMode) -Delegate "$script:DelegateEmail" -ArchiveUrl $(if ($script:StaffMode) { $script:cfg.ArchiveSiteUrl } else { '' })
-                Write-Host "  -> done" -ForegroundColor Green
-                $results[$c.Idx] = New-Result $c.Key $c.Name $c.User.UserPrincipalName $c.User.DisplayName $c.Left $c.User.CreatedDateTime $c.Seen 'DONE (approved in review)' "You approved this one during review. $r" $c.Lics -SignInCheck $c.Sec
-            } catch {
-                Write-Host "  -> FAILED" -ForegroundColor Red
-                $results[$c.Idx] = New-Result $c.Key $c.Name $c.User.UserPrincipalName $c.User.DisplayName $c.Left $c.User.CreatedDateTime $c.Seen 'ERROR' "Failed during review cleanup: $($_.Exception.Message)" $c.Lics -SignInCheck $c.Sec
+            $results[$c.Idx] = New-Result $c.Key $c.Name $c.User.UserPrincipalName $c.User.DisplayName $c.Left $c.User.CreatedDateTime $c.Seen 'QUEUED' "You approved this during review - queued for cleanup." $c.Lics -SignInCheck $c.Sec
+            $c.FromReview = $true
+            $toProcess.Add($c)
+        }
+
+        # ---- Review the skipped/borderline accounts BEFORE anything is disabled ----
+        if ($reviewList.Count -gt 0) {
+            $byReason = $reviewList | Group-Object { ($results[$_.Idx].'Action') } | ForEach-Object { "$($_.Count) x $($_.Name)" }
+            $choice = Show-Menu 'Skipped accounts - decide before anything is disabled' (
+                "$($reviewList.Count) account(s) were held back by the safety checks:`n  $($byReason -join "`n  ")`n`nNothing has been disabled yet. Decide these first - then everything you approve is processed together with the clear-pass accounts.") @(
+                'Review one by one (decide each)',
+                "APPROVE ALL $($reviewList.Count) (I've checked them - add to the cleanup)",
+                'Leave them all skipped')
+
+            if ($choice -eq 1) {
+                if (Show-Confirm "Approve all $($reviewList.Count) held-back account(s) for cleanup?`n`nThis overrides the name-mismatch / recently-active / looks-like-staff checks. Only do this if you're sure they have all left.`n`nProceed?" 'Confirm approve-all') {
+                    foreach ($c in $reviewList) { & $approve $c }
+                }
+            }
+            elseif ($choice -eq 0) {
+                for ($ri = 0; $ri -lt $reviewList.Count; $ri++) {
+                    $c = $reviewList[$ri]
+                    $row = $results[$c.Idx]
+                    $msg = "$($row.'Action')`n`nList entry:  $($c.Key)`nAccount:  $($c.User.DisplayName)  <$($c.User.UserPrincipalName)>`nLast sign-in:  $($c.Seen)`nLicenses:  $($c.Lics)$(if ($c.Sec) { "`nSign-in check:  $($c.Sec)" })`n`n$($row.'Remarks (why)')`n`n($($ri + 1) of $($reviewList.Count))"
+                    $a = Show-Menu 'Skipped account - your decision' $msg @('APPROVE for cleanup', 'Leave it skipped', 'APPROVE this and ALL remaining', 'Stop reviewing')
+                    if ($a -eq 3 -or $a -lt 0) { break }
+                    if ($a -eq 1) { continue }
+                    if ($a -eq 2) { for ($rj = $ri; $rj -lt $reviewList.Count; $rj++) { & $approve $reviewList[$rj] }; break }
+                    & $approve $c
+                }
             }
         }
 
-        # Count by reason so the buttons are informative
-        $byReason = $reviewList | Group-Object { ($results[$_.Idx].'Action') } | ForEach-Object { "$($_.Count) x $($_.Name)" }
-        $choice = Show-Menu 'Skipped accounts - how do you want to handle them?' (
-            "$($reviewList.Count) account(s) were skipped by the safety checks:`n  $($byReason -join "`n  ")`n`nThese are NOT leavers with a clear pass - they were held back for you to check. What would you like to do?") @(
-            'Review one by one (decide each)',
-            "CLEAN UP ALL $($reviewList.Count) now (I've checked them, disable + remove licences)",
-            'Leave them all skipped')
-
-        if ($choice -eq 1) {
-            # bulk approve - extra confirmation because this bypasses the safety checks in one go
-            if (Show-Confirm "You are about to CLEAN UP all $($reviewList.Count) skipped account(s) at once - disable them and remove licences (and for staff, convert mailbox + archive).`n`nThis overrides the name-mismatch / recently-active safety checks. Only do this if you're sure they have all left.`n`nProceed?" 'Confirm bulk cleanup of skipped') {
-                foreach ($c in $reviewList) { & $doOne $c }
+        # ---- Now do ALL the disabling in one pass (clear-pass + approved) ----
+        if ($toProcess.Count -gt 0) {
+            Write-Host "`nApplying cleanup to $($toProcess.Count) account(s)..." -ForegroundColor Cyan
+            $tp = 0
+            foreach ($c in $toProcess) {
+                $tp++
+                Write-Progress -Activity "Applying cleanup" -Status "$tp of $($toProcess.Count): $($c.Key)" -PercentComplete ($tp / $toProcess.Count * 100)
+                $tag = if ($c.FromReview) { ' [approved in review]' } else { '' }
+                try {
+                    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                    Write-Host "`n[$tp/$($toProcess.Count)] Processing $($c.Key) ($($c.User.DisplayName))$tag:" -ForegroundColor White
+                    $r = Invoke-AccountCleanup -User $c.User -DoGroups (-not $NoGroupCleanup) -DoHide (-not $NoHideFromAddressBook) -ConvertToShared ([bool]$script:StaffMode) -Delegate "$script:DelegateEmail" -ArchiveUrl $(if ($script:StaffMode) { $script:cfg.ArchiveSiteUrl } else { '' })
+                    Write-Host "  -> done in $([int]$sw.Elapsed.TotalSeconds)s" -ForegroundColor Green
+                    $st = if ($c.FromReview) { 'DONE (approved in review)' } else { 'DONE' }
+                    $results[$c.Idx] = New-Result $c.Key $c.Name $c.User.UserPrincipalName $c.User.DisplayName $c.Left $c.User.CreatedDateTime $c.Seen $st "$r ($($c.Inactive))." $c.Lics -SignInCheck $c.Sec
+                } catch {
+                    Write-Host "  -> FAILED" -ForegroundColor Red
+                    $results[$c.Idx] = New-Result $c.Key $c.Name $c.User.UserPrincipalName $c.User.DisplayName $c.Left $c.User.CreatedDateTime $c.Seen 'ERROR' "Failed: $($_.Exception.Message)" $c.Lics -SignInCheck $c.Sec
+                }
             }
-        }
-        elseif ($choice -eq 0) {
-            for ($ri = 0; $ri -lt $reviewList.Count; $ri++) {
-                $c = $reviewList[$ri]
-                $row = $results[$c.Idx]
-                $msg = "$($row.'Action')`n`nList entry:  $($c.Key)`nAccount:  $($c.User.DisplayName)  <$($c.User.UserPrincipalName)>`nLast sign-in:  $($c.Seen)`nLicenses:  $($c.Lics)$(if ($c.Sec) { "`nSign-in check:  $($c.Sec)" })`n`n$($row.'Remarks (why)')`n`n($($ri + 1) of $($reviewList.Count))"
-                $a = Show-Menu 'Skipped account - your decision' $msg @('CLEAN UP this account', 'Leave it skipped', 'CLEAN UP this and ALL remaining', 'Stop reviewing')
-                if ($a -eq 3 -or $a -lt 0) { break }
-                if ($a -eq 1) { continue }
-                if ($a -eq 2) { for ($rj = $ri; $rj -lt $reviewList.Count; $rj++) { & $doOne $reviewList[$rj] }; break }
-                & $doOne $c
-            }
+            Write-Progress -Activity "Applying cleanup" -Completed
         }
     }
 
