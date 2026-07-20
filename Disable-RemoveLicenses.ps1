@@ -69,37 +69,49 @@ if ($isAdmin -and -not $Relaunched) {
     }
 }
 
-# ---------- Self-update: pull the latest code from GitHub (only if this folder is a git clone) ----------
-# Keeps every machine running your newest committed code. Fast-forward only (never runs arbitrary
-# merges), fails safe if offline / no git / private-repo auth not set up, and can be skipped with -NoSelfUpdate.
+# ---------- Self-update: always run the newest code from GitHub ----------
+# Works two ways: a git CLONE gets pulled (fast-forward only); a plain DOWNLOAD (no git) fetches the
+# latest script file directly from the PUBLIC repo and replaces itself. Fails safe if offline; skip with -NoSelfUpdate.
+$script:UpdateRawUrl = 'https://raw.githubusercontent.com/xnostra/LeaverCleanupTool-GitHub/main/Disable-RemoveLicenses.ps1'
 if (-not $NoSelfUpdate -and -not $Updated) {
+    $relArg = if ($Relaunched) { ' -Relaunched' } else { '' }
+    $restart = {
+        Write-Host "Updated to the newest version - restarting the tool..." -ForegroundColor Green
+        Start-Sleep -Seconds 1
+        Start-Process (Join-Path $PSHOME 'powershell.exe') -ArgumentList "-NoProfile -STA -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Updated$relArg"
+    }
     try {
-        # Locate git: PATH first, then Git for Windows, then GitHub Desktop's bundled copy
-        $gitExe = (Get-Command git -ErrorAction SilentlyContinue).Source
-        if (-not $gitExe) {
-            $cands = @(
-                "$env:ProgramFiles\Git\cmd\git.exe",
-                "${env:ProgramFiles(x86)}\Git\cmd\git.exe",
-                "$env:LOCALAPPDATA\Programs\Git\cmd\git.exe"
-            )
-            $cands += (Get-ChildItem "$env:LOCALAPPDATA\GitHubDesktop\app-*\resources\app\git\cmd\git.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName)
-            $gitExe = $cands | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+        if (Test-Path (Join-Path $PSScriptRoot '.git')) {
+            # --- Git clone: pull latest (fast-forward only) ---
+            $gitExe = (Get-Command git -ErrorAction SilentlyContinue).Source
+            if (-not $gitExe) {
+                $cands = @("$env:ProgramFiles\Git\cmd\git.exe", "${env:ProgramFiles(x86)}\Git\cmd\git.exe", "$env:LOCALAPPDATA\Programs\Git\cmd\git.exe")
+                $cands += (Get-ChildItem "$env:LOCALAPPDATA\GitHubDesktop\app-*\resources\app\git\cmd\git.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName)
+                $gitExe = $cands | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+            }
+            if ($gitExe) {
+                Write-Host "Checking for the latest version on GitHub..." -ForegroundColor Gray
+                $env:GIT_TERMINAL_PROMPT = '0'
+                Push-Location $PSScriptRoot
+                $before = (& $gitExe rev-parse HEAD 2>$null)
+                & $gitExe fetch --quiet 2>$null
+                & $gitExe merge --ff-only '@{u}' 2>$null | Out-Null
+                $after  = (& $gitExe rev-parse HEAD 2>$null)
+                Pop-Location
+                if ($before -and $after -and $before -ne $after) { & $restart; exit }
+            }
         }
-        if ($gitExe -and (Test-Path (Join-Path $PSScriptRoot '.git'))) {
+        else {
+            # --- Plain download (no git): fetch the latest script file from the public repo ---
             Write-Host "Checking for the latest version on GitHub..." -ForegroundColor Gray
-            $env:GIT_TERMINAL_PROMPT = '0'   # never hang waiting for a login prompt - just fail fast
-            Push-Location $PSScriptRoot
-            $before = (& $gitExe rev-parse HEAD 2>$null)
-            & $gitExe fetch --quiet 2>$null
-            & $gitExe merge --ff-only '@{u}' 2>$null | Out-Null
-            $after  = (& $gitExe rev-parse HEAD 2>$null)
-            Pop-Location
-            if ($before -and $after -and $before -ne $after) {
-                Write-Host "Updated to the newest version - restarting the tool..." -ForegroundColor Green
-                Start-Sleep -Seconds 1
-                $relArg = if ($Relaunched) { ' -Relaunched' } else { '' }
-                Start-Process (Join-Path $PSHOME 'powershell.exe') -ArgumentList "-NoProfile -STA -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Updated$relArg"
-                exit
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $remote = (Invoke-WebRequest -Uri $script:UpdateRawUrl -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop).Content
+            if ($remote -and $remote.Length -gt 2000) {
+                $local = Get-Content -Raw -LiteralPath $PSCommandPath -ErrorAction Stop
+                if (($remote -replace "`r","") -ne ($local -replace "`r","")) {
+                    Set-Content -LiteralPath $PSCommandPath -Value $remote -Encoding UTF8
+                    & $restart; exit
+                }
             }
         }
     } catch { Pop-Location -ErrorAction SilentlyContinue }
