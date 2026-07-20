@@ -197,15 +197,51 @@ function Invoke-WithRetry {
 }
 
 # ---------- Helpers ----------
-$skuNames = @{
-    '31d57bc7-3a05-4867-ab53-97a17835a411' = 'Microsoft 365 A1'
-    '314c4481-f395-4525-be8b-2ec4bb1e9d91' = 'Office 365 A1 Student'
-    '94763226-9b3c-4e75-a931-5c89701abe66' = 'Office 365 A1 Faculty'
-    'f30db892-07e9-47e9-837c-80727f46fd3d' = 'Power Automate Free'
-    'a403ebcc-fae0-4ca2-8c8c-7a907fd6c235' = 'Power BI Free'
+# Friendly display names for common Microsoft license "part numbers". Anything not listed here
+# falls back to the tenant's own part number (which is accurate), never a raw GUID.
+$script:skuFriendly = @{
+    'M365EDU_A1'                  = 'Microsoft 365 A1'
+    'M365EDU_A3_STUUSEBNFT'       = 'Microsoft 365 A3 for students use benefit'
+    'M365EDU_A3_FACULTY'          = 'Microsoft 365 A3 for faculty'
+    'M365EDU_A5_STUUSEBNFT'       = 'Microsoft 365 A5 for students use benefit'
+    'M365EDU_A5_FACULTY'          = 'Microsoft 365 A5 for faculty'
+    'M365EDU_A5_NOPSTNCONF_STUUSEBNFT' = 'Microsoft 365 A5 without Audio Conferencing (students)'
+    'STANDARDWOFFPACK_STUDENT'    = 'Office 365 A1 for students'
+    'STANDARDWOFFPACK_FACULTY'    = 'Office 365 A1 for faculty'
+    'STANDARDWOFFPACK_IW_STUDENT' = 'Office 365 A1 Plus for students'
+    'STANDARDWOFFPACK_IW_FACULTY' = 'Office 365 A1 Plus for faculty'
+    'OFFICESUBSCRIPTION_STUDENT'  = 'Microsoft 365 Apps for students'
+    'OFFICESUBSCRIPTION_FACULTY'  = 'Microsoft 365 Apps for faculty'
+    'ENTERPRISEPACK'              = 'Office 365 E3'
+    'ENTERPRISEPREMIUM'           = 'Office 365 E5'
+    'FLOW_FREE'                   = 'Power Automate Free'
+    'POWER_BI_STANDARD'           = 'Power BI (free)'
+    'PROJECT_P1'                  = 'Project Plan 1'
+    'WIN_DEF_ATP'                 = 'Microsoft Defender for Endpoint'
+    'EMS'                         = 'Enterprise Mobility + Security E3'
+    'EMSPREMIUM'                  = 'Enterprise Mobility + Security E5'
+}
+# Live map of the tenant's own SkuId -> part number (built once, on first use).
+$script:skuIdToPart = $null
+function Get-TenantSkuMap {
+    if ($null -ne $script:skuIdToPart) { return $script:skuIdToPart }
+    $script:skuIdToPart = @{}
+    try {
+        foreach ($s in (Get-MgSubscribedSku -All -ErrorAction Stop)) {
+            if ($s.SkuId) { $script:skuIdToPart["$($s.SkuId)".ToLower()] = "$($s.SkuPartNumber)" }
+        }
+    } catch { }
+    return $script:skuIdToPart
 }
 function Get-LicNames($skus) {
-    (@($skus) | Where-Object { $_ } | ForEach-Object { $g = "$_"; if ($skuNames.ContainsKey($g)) { $skuNames[$g] } else { "Other ($($g.Substring(0,8))...)" } }) -join ', '
+    $map = Get-TenantSkuMap
+    (@($skus) | Where-Object { $_ } | ForEach-Object {
+        $id = "$_".ToLower()
+        $part = if ($map.ContainsKey($id)) { $map[$id] } else { '' }
+        if ($part -and $script:skuFriendly.ContainsKey($part)) { $script:skuFriendly[$part] }
+        elseif ($part) { $part }
+        else { "Unknown licence ($("$_".Substring(0,8))...)" }
+    }) -join ', '
 }
 
 function Get-EditDistance($s, $t) {
