@@ -69,21 +69,20 @@ if ($isAdmin -and -not $Relaunched) {
     }
 }
 
-# ---------- Build stamp (bump this every time you change the script) ----------
-# Format YYYYMMDDNN. The self-update only replaces the local file when the remote stamp is HIGHER,
-# so it can never downgrade to older code.
-$script:ToolBuildStamp = 2026072001
-
-# ---------- Self-update: always run the newest code from GitHub ----------
-# Works two ways: a git CLONE gets pulled (fast-forward only, which is already forward-only and safe);
-# a plain DOWNLOAD (no git) fetches the latest script from the PUBLIC repo and replaces itself ONLY IF
-# the remote build stamp is newer AND the download looks like a valid copy of this tool.
-# Fails safe if offline; skip with -NoSelfUpdate.
-$script:UpdateRawUrl = 'https://raw.githubusercontent.com/xnostra/LeaverCleanupTool-GitHub/main/Disable-RemoveLicenses.ps1'
+# ---------- Self-update: always run the newest code from GitHub (fully automatic) ----------
+# No manual version bumping needed. It detects any new commit on your repo by itself:
+#   - a git CLONE is pulled (fast-forward only, always forward, never a downgrade);
+#   - a plain DOWNLOAD (no git) checks the repo's latest commit id via the GitHub API and, if it has
+#     changed since last time, fetches the script and replaces itself - but only if the download is a
+#     valid copy of this tool (right header + param block + sensible size), so it can't install a broken file.
+# Fails safe if offline / API unreachable; skip with -NoSelfUpdate.
+$script:Owner = 'xnostra'
+$script:Repo  = 'LeaverCleanupTool-GitHub'
+$script:UpdateRawUrl = "https://raw.githubusercontent.com/$($script:Owner)/$($script:Repo)/main/Disable-RemoveLicenses.ps1"
 if (-not $NoSelfUpdate -and -not $Updated) {
     $relArg = if ($Relaunched) { ' -Relaunched' } else { '' }
     $restart = {
-        Write-Host "Updated to the newest version - restarting the tool..." -ForegroundColor Green
+        Write-Host "Updated to the newest version on GitHub - restarting the tool..." -ForegroundColor Green
         Start-Sleep -Seconds 1
         Start-Process (Join-Path $PSHOME 'powershell.exe') -ArgumentList "-NoProfile -STA -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Updated$relArg"
     }
@@ -97,7 +96,7 @@ if (-not $NoSelfUpdate -and -not $Updated) {
                 $gitExe = $cands | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
             }
             if ($gitExe) {
-                Write-Host "Checking for the latest version on GitHub..." -ForegroundColor Gray
+                Write-Host "Checking GitHub for the latest version..." -ForegroundColor Gray
                 $env:GIT_TERMINAL_PROMPT = '0'
                 Push-Location $PSScriptRoot
                 $before = (& $gitExe rev-parse HEAD 2>$null)
@@ -109,24 +108,30 @@ if (-not $NoSelfUpdate -and -not $Updated) {
             }
         }
         else {
-            # --- Plain download (no git): fetch the latest script from the public repo, with safety checks ---
-            Write-Host "Checking for the latest version on GitHub..." -ForegroundColor Gray
+            # --- Plain download (no git): detect new commit via GitHub API, then fetch & replace ---
+            Write-Host "Checking GitHub for the latest version..." -ForegroundColor Gray
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            $remote = (Invoke-WebRequest -Uri $script:UpdateRawUrl -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop).Content
-
-            # SAFETY 1: the download must actually look like this tool (not an error page or a truncated file)
-            $looksValid = $remote -and $remote.Length -gt 5000 -and
-                          $remote -match 'MICROSOFT 365 LEAVER CLEANUP TOOL' -and
-                          $remote -match 'ToolBuildStamp' -and
-                          $remote -match 'param\('
-            # SAFETY 2: only update when the remote build stamp is NEWER than ours (never downgrade)
-            $remoteStamp = 0
-            if ($remote -match "ToolBuildStamp\s*=\s*(\d+)") { $remoteStamp = [long]$Matches[1] }
-
-            if ($looksValid -and $remoteStamp -gt $script:ToolBuildStamp) {
-                Write-Host "A newer version is available (build $remoteStamp > $($script:ToolBuildStamp))." -ForegroundColor Gray
-                Set-Content -LiteralPath $PSCommandPath -Value $remote -Encoding UTF8
-                & $restart; exit
+            $hdr = @{ 'User-Agent' = 'LeaverCleanupTool'; 'Accept' = 'application/vnd.github+json' }
+            $remoteSha = (Invoke-RestMethod -Uri "https://api.github.com/repos/$($script:Owner)/$($script:Repo)/commits/main" -Headers $hdr -TimeoutSec 15 -ErrorAction Stop).sha
+            $stateFile = Join-Path $PSScriptRoot 'LeaverTool.update-state'
+            $storedSha = if (Test-Path $stateFile) { (Get-Content -Raw -LiteralPath $stateFile -ErrorAction SilentlyContinue).Trim() } else { '' }
+            if ($remoteSha -and $remoteSha -ne $storedSha) {
+                # There is a new commit since we last checked - get the script and update if it truly changed
+                $remote = (Invoke-WebRequest -Uri $script:UpdateRawUrl -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop).Content
+                $looksValid = $remote -and $remote.Length -gt 5000 -and ($remote -match 'MICROSOFT 365 LEAVER CLEANUP TOOL') -and ($remote -match 'param\(')
+                if ($looksValid) {
+                    $norm  = { param($t) ("$t".Replace([char]0xFEFF, '').Replace("`r", '')) }
+                    $local = Get-Content -Raw -LiteralPath $PSCommandPath -ErrorAction Stop
+                    if ((& $norm $remote) -ne (& $norm $local)) {
+                        # write UTF-8 WITHOUT BOM so the comparison never re-triggers next launch
+                        [System.IO.File]::WriteAllText($PSCommandPath, $remote, (New-Object System.Text.UTF8Encoding($false)))
+                        Set-Content -LiteralPath $stateFile -Value $remoteSha -Encoding ASCII -ErrorAction SilentlyContinue
+                        & $restart; exit
+                    } else {
+                        # already up to date - just remember this commit so we don't re-check the file every launch
+                        Set-Content -LiteralPath $stateFile -Value $remoteSha -Encoding ASCII -ErrorAction SilentlyContinue
+                    }
+                }
             }
         }
     } catch { Pop-Location -ErrorAction SilentlyContinue }

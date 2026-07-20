@@ -16,3 +16,6 @@ pupils.csv
 # Local config - holds YOUR organisation's real values, never publish this
 LeaverTool.json
 LeaverTool.local.json
+
+# Self-update state (per-machine, not shared)
+LeaverTool.update-state
