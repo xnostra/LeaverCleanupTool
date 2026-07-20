@@ -1138,7 +1138,7 @@ function Start-BulkMode {
                 $tag = if ($c.FromReview) { ' [approved in review]' } else { '' }
                 try {
                     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-                    Write-Host "`n[$tp/$($toProcess.Count)] Processing $($c.Key) ($($c.User.DisplayName))$tag:" -ForegroundColor White
+                    Write-Host "`n[$tp/$($toProcess.Count)] Processing $($c.Key) ($($c.User.DisplayName))${tag}:" -ForegroundColor White
                     $r = Invoke-AccountCleanup -User $c.User -DoGroups (-not $NoGroupCleanup) -DoHide (-not $NoHideFromAddressBook) -ConvertToShared ([bool]$script:StaffMode) -Delegate "$script:DelegateEmail" -ArchiveUrl $(if ($script:StaffMode) { $script:cfg.ArchiveSiteUrl } else { '' })
                     Write-Host "  -> done in $([int]$sw.Elapsed.TotalSeconds)s" -ForegroundColor Green
                     $st = if ($c.FromReview) { 'DONE (approved in review)' } else { 'DONE' }
