@@ -30,11 +30,15 @@ param(
     [string]$DelegateEmail,             # optional: give this person full access to converted shared mailboxes
     [string]$ArchiveSiteUrl,            # optional: SharePoint site to auto-copy leavers' OneDrive files into (e.g. https://tenant.sharepoint.com/sites/StaffArchive)
     [ValidateSet('Students','Staff')]
-    [string]$ListType = 'Students',     # what kind of people are in the list; Students runs REFUSE to touch accounts that look like staff
+    [string]$ListType = 'Students',     # what kind of people are in the list (Staff = preserve email + archive OneDrive)
+    [switch]$CleanEverything,           # treat every account found in the list as APPROVED - bypass the name-mismatch / recently-active / recycled-address holds
     [switch]$Relaunched,                # internal: set automatically when the script relaunches itself without admin rights
     [switch]$NoSelfUpdate,              # skip the "pull latest from GitHub" check at startup
     [switch]$Updated                    # internal: set automatically after a self-update relaunch (prevents update loops)
 )
+
+# Approval mode: when true, every matched account in the list is fully cleaned (holds bypassed).
+$script:ForceClean = [bool]$CleanEverything
 
 # ---------- If elevated, relaunch WITHOUT admin rights (Microsoft sign-in fails when elevated) ----------
 # Exchange Online's sign-in cannot open when PowerShell runs as administrator. We detect that and
@@ -437,28 +441,6 @@ function Show-Info {
     [void][System.Windows.Forms.MessageBox]::Show($Message, $Title, [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
 }
 
-# Multi-line paste box (for pasting many email addresses at once). Returns the text, or $null if cancelled.
-function Show-MultilineInput {
-    param([string]$Title, [string]$Message)
-    Initialize-Gui
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = $Title; $form.StartPosition = 'CenterScreen'
-    $form.Width = 540; $form.Height = 480; $form.TopMost = $true
-    $form.FormBorderStyle = 'FixedDialog'; $form.MaximizeBox = $false; $form.MinimizeBox = $false
-    $lbl = New-Object System.Windows.Forms.Label
-    $lbl.Text = $Message; $lbl.SetBounds(14, 12, 500, 90)
-    $tb = New-Object System.Windows.Forms.TextBox
-    $tb.Multiline = $true; $tb.ScrollBars = 'Vertical'; $tb.AcceptsReturn = $true
-    $tb.SetBounds(14, 108, 500, 280); $tb.Font = New-Object System.Drawing.Font('Consolas', 10)
-    $ok = New-Object System.Windows.Forms.Button
-    $ok.Text = 'OK'; $ok.SetBounds(318, 398, 90, 32); $ok.DialogResult = 'OK'
-    $cancel = New-Object System.Windows.Forms.Button
-    $cancel.Text = 'Cancel'; $cancel.SetBounds(420, 398, 90, 32); $cancel.DialogResult = 'Cancel'
-    $form.Controls.AddRange(@($lbl, $tb, $ok, $cancel))
-    $form.AcceptButton = $null; $form.CancelButton = $cancel
-    if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { return $tb.Text }
-    return $null
-}
 
 # File picker popup for choosing the leavers list
 function Select-InputFile {
@@ -662,126 +644,6 @@ function Start-PurgeMode {
         }
         Show-Info "$($deleted.Count) account(s) deleted.`n`nThey stay restorable for 30 days in the Entra admin center (Users > Deleted users). After that they are gone forever.`n`nRecord saved: $delPath" 'Purge finished'
     }
-}
-
-# ---------- DELETE by pasted email addresses (direct deletion) ----------
-# Paste any number of email addresses; matched CLOUD accounts are deleted (soft-delete: 30-day
-# recycle bin, then gone forever). Hybrid (on-prem synced) accounts are NOT deleted here - they
-# are listed as "fix in local AD". Everything is written to an Excel report.
-function Start-DeleteByEmailMode {
-    $raw = Show-MultilineInput 'DELETE accounts by email' (
-        "Paste the email addresses to DELETE - one per line (commas, semicolons or spaces also work).`n`n" +
-        "WARNING: this PERMANENTLY deletes the matched accounts. They go to Microsoft's recycle bin for 30 days " +
-        "(restorable in Entra admin center > Deleted users), then are gone FOREVER including OneDrive.`n`n" +
-        "Hybrid accounts (synced from on-premises AD) will NOT be deleted here - they must be removed in your local AD.")
-    if (-not $raw) { return }
-
-    $emails = @($raw -split '[\r\n,; ]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '@' } | Select-Object -Unique)
-    if ($emails.Count -eq 0) { Show-Info 'No valid email addresses were found in what you pasted.' 'Nothing to delete'; return }
-
-    Write-Host "Looking up $($emails.Count) address(es)..." -ForegroundColor Cyan
-    $users = Get-AllTenantUsers
-    $byUpn = @{}; $byMail = @{}; $byProxy = @{}
-    foreach ($u in $users) {
-        if ($u.UserPrincipalName) { $byUpn[$u.UserPrincipalName.ToLower()] = $u }
-        if ($u.Mail)             { $byMail[$u.Mail.ToLower()] = $u }
-        foreach ($p in @($u.ProxyAddresses)) { if ($p -match '^smtp:(.+)$') { $byProxy[$Matches[1].ToLower()] = $u } }
-    }
-
-    $toDelete = New-Object System.Collections.Generic.List[object]
-    $hybrid   = New-Object System.Collections.Generic.List[object]
-    $noMatch  = New-Object System.Collections.Generic.List[string]
-    foreach ($e in $emails) {
-        $k = $e.ToLower()
-        $u = $byUpn[$k]; if (-not $u) { $u = $byMail[$k] }; if (-not $u) { $u = $byProxy[$k] }
-        if (-not $u) { $noMatch.Add($e); continue }
-        if ($u.OnPremisesSyncEnabled -eq $true) { $hybrid.Add([pscustomobject]@{ Email = $e; User = $u }); continue }
-        $toDelete.Add([pscustomobject]@{ Email = $e; User = $u })
-    }
-
-    $preview = "Pasted addresses: $($emails.Count)`n`n" +
-               "WILL DELETE (cloud accounts): $($toDelete.Count)`n" +
-               "Hybrid - skipped, fix in local AD: $($hybrid.Count)`n" +
-               "No matching account found: $($noMatch.Count)`n`n" +
-               "This PERMANENTLY deletes the $($toDelete.Count) matched account(s) (30-day recycle bin, then gone forever).`n`n" +
-               "Are you absolutely sure?"
-
-    $results = New-Object System.Collections.Generic.List[object]
-
-    if ($toDelete.Count -eq 0) {
-        Show-Info "$preview`n`nThere is nothing to delete." 'Delete by email'
-    }
-    elseif (Show-Confirm $preview 'CONFIRM PERMANENT DELETE') {
-        $done = 0
-        foreach ($d in $toDelete) {
-            $status = 'DELETED'
-            try {
-                Remove-MgUser -UserId $d.User.Id -ErrorAction Stop
-                $done++
-                Write-Host "  deleted: $($d.User.UserPrincipalName)" -ForegroundColor Green
-                Write-Log "EMAIL-DELETE: $($d.User.UserPrincipalName) ($($d.User.DisplayName))"
-            } catch {
-                $status = "FAILED: $($_.Exception.Message)"
-                Write-Host "  FAILED: $($d.User.UserPrincipalName) -> $($_.Exception.Message)" -ForegroundColor Red
-                Write-Log "EMAIL-DELETE-FAILED: $($d.User.UserPrincipalName) -> $($_.Exception.Message)"
-            }
-            $results.Add([pscustomobject]@{
-                'Pasted Email' = $d.Email
-                'Account'      = $d.User.UserPrincipalName
-                'Display Name' = $d.User.DisplayName
-                'Result'       = $status
-            })
-        }
-        Write-Host "$done account(s) deleted." -ForegroundColor Green
-    }
-    else {
-        Write-Host "Cancelled - nothing was deleted." -ForegroundColor Yellow
-        return
-    }
-
-    # Add hybrid + no-match rows to the same report
-    foreach ($h in $hybrid) {
-        $results.Add([pscustomobject]@{
-            'Pasted Email' = $h.Email
-            'Account'      = $h.User.UserPrincipalName
-            'Display Name' = $h.User.DisplayName
-            'Result'       = 'FAILED - hybrid account (synced from on-premises AD). Must be deleted/disabled in your LOCAL Active Directory, not the cloud.'
-        })
-    }
-    foreach ($n in $noMatch) {
-        $results.Add([pscustomobject]@{ 'Pasted Email' = $n; 'Account' = ''; 'Display Name' = ''; 'Result' = 'NO MATCH - no account found for this email.' })
-    }
-
-    # Excel report
-    $repPath = Join-Path $PSScriptRoot ("COMMITTED_delete_{0:yyyyMMdd_HHmm}.xlsx" -f (Get-Date))
-    if (Get-Module -ListAvailable ImportExcel) {
-        Import-Module ImportExcel
-        $ct = @(
-            New-ConditionalText -Text 'DELETED' -ConditionalTextColor Black -BackgroundColor LightGreen
-            New-ConditionalText -Text 'FAILED'  -ConditionalTextColor White -BackgroundColor Red
-            New-ConditionalText -Text 'NO MATCH' -ConditionalTextColor Black -BackgroundColor Khaki
-        )
-        $pkg = $results | Export-Excel $repPath -WorksheetName 'Deletions' -AutoFilter -FreezeTopRow -BoldTopRow -ConditionalText $ct -PassThru
-        $ws = $pkg.Workbook.Worksheets['Deletions']
-        $w = @(34, 34, 30, 80); for ($c = 1; $c -le $w.Count; $c++) { $ws.Column($c).Width = $w[$c - 1] }
-        $ws.Cells["D2:D$($ws.Dimension.End.Row)"].Style.WrapText = $true
-        Close-ExcelPackage $pkg
-        if ($hybrid.Count -gt 0) {
-            $results | Where-Object { $_.Result -like 'FAILED - hybrid*' } |
-                Export-Excel $repPath -WorksheetName 'Fix in Local AD' -TableStyle Medium6 -AutoSize -AutoFilter -BoldTopRow -FreezeTopRow
-        }
-    } else {
-        $repPath = [System.IO.Path]::ChangeExtension($repPath, '.csv')
-        $results | Export-Csv $repPath -NoTypeInformation -Encoding UTF8
-    }
-
-    $deletedCount = @($results | Where-Object { $_.Result -eq 'DELETED' }).Count
-    Show-Info ("Delete-by-email finished.`n`n" +
-        "Deleted: $deletedCount`n" +
-        "Hybrid (fix in local AD): $($hybrid.Count)`n" +
-        "No match: $($noMatch.Count)`n`n" +
-        "Deleted accounts are restorable for 30 days in the Entra admin center (Users > Deleted users).`n`n" +
-        "Report saved: $repPath") 'Delete by email - done'
 }
 
 # ---------- Undo support: snapshot of an account before we touch it ----------
@@ -1258,27 +1120,33 @@ function Start-BulkMode {
             $note += " Note: account has no job title/faculty licence but you ran it as STAFF - processing as instructed."
         }
 
-        # ---- FAILSAFE: account created AFTER the pupil left = recycled address (only when the name differs) ----
+        # ---- FAILSAFE: account created AFTER the person left = recycled address (only when the name differs) ----
+        # In "clean everything in the list" mode these holds are bypassed - the list is your approval.
         if ($left -is [datetime] -and $u.CreatedDateTime -and $u.CreatedDateTime -gt $left) {
             if ($sameName) {
                 $note = " Note: account created after leaving date, but the name matches your leaver - treated as the same person."
-            } else {
+            } elseif (-not $script:ForceClean) {
                 $results.Add((New-Result $key $name $u.UserPrincipalName $dn $left $u.CreatedDateTime $seen 'SKIP - new account' "Recycled address: YOUR leaver was '$name' (left $($left.ToString('yyyy-MM-dd'))) but this account was created later and now belongs to '$dn' - a different person. Not touched." $lics))
                 continue
+            } else {
+                $note += " Note: account created after the leaving date and the name differs - cleaned anyway because it was in your approved list."
             }
         }
 
         # ---- FAILSAFE: global created-after cutoff ----
-        if ($SkipIfCreatedAfter -and $u.CreatedDateTime -and $u.CreatedDateTime -gt $SkipIfCreatedAfter -and -not $sameName) {
+        if (-not $script:ForceClean -and $SkipIfCreatedAfter -and $u.CreatedDateTime -and $u.CreatedDateTime -gt $SkipIfCreatedAfter -and -not $sameName) {
             $results.Add((New-Result $key $name $u.UserPrincipalName $dn $left $u.CreatedDateTime $seen 'SKIP - new account' "Account created after your cutoff date ($($SkipIfCreatedAfter.ToString('yyyy-MM-dd'))) and belongs to '$dn' - likely a NEW student with a recycled address. Not touched." $lics))
             continue
         }
 
         # ---- FAILSAFE: name cross-check ----
-        if ($name -and $email -and -not $sameName) {
+        if (-not $script:ForceClean -and $name -and $email -and -not $sameName) {
             $results.Add((New-Result $key $name $u.UserPrincipalName $dn $left $u.CreatedDateTime $seen 'REVIEW - name mismatch' "Your list says '$name' but the account is named '$dn' - names genuinely differ. Not touched - check if same person, handle manually." $lics))
             if ($DoCommit) { $reviewList.Add(@{ Idx = $results.Count - 1; User = $u; Key = $key; Name = $name; Left = $left; Seen = $seen; Lics = $lics; Sec = $sec; Inactive = $inactiveTxt }) }
             continue
+        }
+        elseif ($script:ForceClean -and $name -and $email -and -not $sameName) {
+            $note += " Note: list name '$name' differs from account name '$dn' - cleaned anyway because it was in your approved list."
         }
 
         # Sign-in security check (logs only go back ~30 days)
@@ -1287,10 +1155,13 @@ function Start-BulkMode {
         }
 
         # ---- FAILSAFE: recently active ----
-        if ($SkipIfActiveWithinDays -gt 0 -and $lastSignIn -and $lastSignIn -gt $activeCutoff) {
+        if (-not $script:ForceClean -and $SkipIfActiveWithinDays -gt 0 -and $lastSignIn -and $lastSignIn -gt $activeCutoff) {
             $results.Add((New-Result $key $name $u.UserPrincipalName $dn $left $u.CreatedDateTime $seen 'SKIP - recently active' "Account name is '$dn'. Someone signed in within the last $SkipIfActiveWithinDays days (last: $seen). Might still be in use - not touched. Check manually if they really left." $lics -SignInCheck $sec))
             if ($DoCommit) { $reviewList.Add(@{ Idx = $results.Count - 1; User = $u; Key = $key; Name = $name; Left = $left; Seen = $seen; Lics = $lics; Sec = $sec; Inactive = $inactiveTxt }) }
             continue
+        }
+        elseif ($script:ForceClean -and $SkipIfActiveWithinDays -gt 0 -and $lastSignIn -and $lastSignIn -gt $activeCutoff) {
+            $note += " Note: signed in within the last $SkipIfActiveWithinDays days (last: $seen) - cleaned anyway because it was in your approved list."
         }
 
         # ---- FAST-SKIP: already disabled AND no licence = already done, nothing to do (saves time) ----
@@ -1483,9 +1354,8 @@ else {
             'Individual account  -  look up one person and decide',
             'RESTORE  -  undo a previous cleanup for someone',
             'PURGE stale accounts  -  delete accounts dead for years',
-            'DELETE by email  -  paste email addresses to delete now',
             'Exit')
-        if ($choice -lt 0 -or $choice -eq 6) { return }
+        if ($choice -lt 0 -or $choice -eq 5) { return }
 
         if ($choice -eq 0 -or $choice -eq 1) {
             $t = Show-Menu 'Who is in this list?' "Choose who you are cleaning up.`n`nYour choice is respected - accounts are processed as instructed (mismatches are noted, not skipped).`nSTAFF runs preserve mailboxes (converted to shared) and archive OneDrive." @(
@@ -1498,6 +1368,12 @@ else {
 
             $p = Select-InputFile
             if (-not $p) { continue }
+
+            # Approval mode: is every account in this list pre-approved for a full clean?
+            $script:ForceClean = Show-YesNo (
+                "Treat EVERY account found in your list as approved for a full cleanup?`n`n" +
+                "YES = clean every matched account the same way (Staff or Student), skipping the name-mismatch, recently-active and recycled-address holds. Use this when you're certain everyone in the list has left.`n`n" +
+                "NO  = careful mode: hold those borderline cases back for you to review before anything changes.") 'Approve everyone in the list?'
 
             if ($choice -eq 0) {
                 # ---- DRY RUN ----
@@ -1514,7 +1390,8 @@ else {
                     if ($script:cfg.ArchiveSiteUrl) { Save-Config }
                 }
                 $what = if ($script:StaffMode) { "STAFF cleanup:`n- disable sign-in`n- convert mailbox to shared (email kept forever)`n- archive OneDrive`n- remove groups + hide from address book`n- remove licenses" } else { "STUDENT cleanup:`n- disable sign-in`n- remove groups + hide from address book`n- remove licenses" }
-                if (Show-Confirm "$what`n`nList: $(Split-Path $p -Leaf)`n`nThis makes REAL changes. An undo file is saved first. Continue?" 'Confirm commit') {
+                $modeLine = if ($script:ForceClean) { "`n`nMODE: CLEAN EVERYONE in the list (name-mismatch / recently-active / recycled-address holds are BYPASSED)." } else { "`n`nMODE: careful (borderline cases are held back for your review first)." }
+                if (Show-Confirm "$what$modeLine`n`nList: $(Split-Path $p -Leaf)`n`nThis makes REAL changes. An undo file is saved first. Continue?" 'Confirm commit') {
                     Start-BulkMode -Path $p -DoCommit $true
                 } else { Write-Host "Cancelled." }
             }
@@ -1522,6 +1399,5 @@ else {
         elseif ($choice -eq 2) { Start-IndividualMode }
         elseif ($choice -eq 3) { Start-RestoreMode }
         elseif ($choice -eq 4) { Start-PurgeMode }
-        elseif ($choice -eq 5) { Start-DeleteByEmailMode }
     }
 }
