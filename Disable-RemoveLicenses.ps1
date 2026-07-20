@@ -77,7 +77,7 @@ if ($isAdmin -and -not $Relaunched) {
 #     valid copy of this tool (right header + param block + sensible size), so it can't install a broken file.
 # Fails safe if offline / API unreachable; skip with -NoSelfUpdate.
 $script:Owner = 'xnostra'
-$script:Repo  = 'LeaverCleanupTool-GitHub'
+$script:Repo  = 'LeaverCleanupTool'
 $script:UpdateRawUrl = "https://raw.githubusercontent.com/$($script:Owner)/$($script:Repo)/main/Disable-RemoveLicenses.ps1"
 if (-not $NoSelfUpdate -and -not $Updated) {
     $relArg = if ($Relaunched) { ' -Relaunched' } else { '' }

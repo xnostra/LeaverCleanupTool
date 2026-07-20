@@ -30,15 +30,7 @@ Write-Host "Microsoft 365 Leaver Cleanup Tool" -ForegroundColor Cyan
 Write-Host "======================================" -ForegroundColor Cyan
 Write-Host ""
 
-# This tool must NOT run elevated (elevation breaks Microsoft sign-in)
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if ($isAdmin) {
-    Write-Host "This tool must run as a NORMAL user (not Administrator)." -ForegroundColor Red
-    Write-Host "Elevated windows break the Microsoft sign-in prompt." -ForegroundColor Red
-    Write-Host "Please open a normal (non-admin) PowerShell window and run the one-liner again." -ForegroundColor Yellow
-    Read-Host "Press Enter to close"
-    return
-}
 
 try {
     if (-not (Test-Path $installDir)) {
@@ -51,20 +43,46 @@ try {
 
     # Download the latest main script into the permanent folder
     Invoke-RestMethod -Uri $scriptUrl -UseBasicParsing -ErrorAction Stop | Out-File -FilePath $scriptPath -Encoding UTF8 -Force
-    Write-Host "Ready. Launching the tool..." -ForegroundColor Green
-    Write-Host ""
 
-    # Launch in a fresh STA PowerShell process so:
-    #  - the Windows Forms dialogs (file pickers, prompts) work
-    #  - $PSScriptRoot resolves to the permanent folder (undo files/logs/config persist)
-    Start-Process powershell.exe -ArgumentList @(
-        "-NoProfile",
-        "-STA",
-        "-ExecutionPolicy", "Bypass",
-        "-File", "`"$scriptPath`""
-    )
+    $psArgs = "-NoProfile -STA -ExecutionPolicy Bypass -File `"$scriptPath`""
 
-    Write-Host "The tool has opened in a new window." -ForegroundColor Cyan
+    if ($isAdmin) {
+        # PowerShell is elevated, but this tool's Microsoft sign-in breaks under admin.
+        # Force-launch the tool as the NORMAL interactive user via a one-off scheduled task
+        # (a child process would otherwise inherit admin - a scheduled task at "Limited"
+        #  run level is the reliable way to drop back to normal rights).
+        Write-Host "Detected an Administrator PowerShell." -ForegroundColor Yellow
+        Write-Host "Force-launching the tool as your NORMAL user (so Microsoft sign-in works)..." -ForegroundColor Yellow
+        Write-Host ""
+
+        $launched = $false
+        try {
+            $me     = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $action = New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'powershell.exe') -Argument $psArgs -WorkingDirectory $installDir
+            $princ  = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
+            $task   = New-ScheduledTask -Action $action -Principal $princ
+            $tn     = 'LeaverCleanup_LaunchAsUser'
+            Register-ScheduledTask -TaskName $tn -InputObject $task -Force -ErrorAction Stop | Out-Null
+            Start-ScheduledTask -TaskName $tn -ErrorAction Stop
+            Start-Sleep -Seconds 2
+            Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+            $launched = $true
+        } catch {
+            Write-Host "Scheduled-task launch failed: $($_.Exception.Message)" -ForegroundColor Red
+        }
+
+        if (-not $launched) {
+            # Fallback: launch via explorer.exe, which always runs at normal (medium) integrity
+            Write-Host "Falling back to explorer launch..." -ForegroundColor Yellow
+            Start-Process "explorer.exe" -ArgumentList "`"$scriptPath`""
+        }
+    }
+    else {
+        # Already a normal user - launch directly in a fresh STA window
+        Start-Process powershell.exe -ArgumentList $psArgs
+    }
+
+    Write-Host "The tool is opening in a new window (as your normal user)." -ForegroundColor Green
     Write-Host "All reports, undo files, and logs are saved in:" -ForegroundColor Gray
     Write-Host "  $installDir" -ForegroundColor Gray
 }

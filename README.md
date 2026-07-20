@@ -12,7 +12,7 @@ Built for schools and organisations that offboard people in batches (e.g., end o
 irm https://raw.githubusercontent.com/xnostra/LeaverCleanupTool/main/invoke-leaver.ps1 | iex
 ```
 
-> Run this in a **normal (non-admin)** PowerShell window. The tool installs itself into a permanent folder on your Desktop so your undo files, logs, and config persist between runs. Re-running the one-liner updates the tool in place.
+> Works from **either a normal or an Administrator** PowerShell window — if it detects admin, it automatically relaunches the tool as your normal user (required for Microsoft sign-in) via a one-off scheduled task. The tool installs into a permanent folder on your Desktop so undo files, logs, and config persist between runs. Re-running the one-liner updates the tool in place.
 
 **Option B — Manual:**
 
