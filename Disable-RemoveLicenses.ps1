@@ -437,6 +437,29 @@ function Show-Info {
     [void][System.Windows.Forms.MessageBox]::Show($Message, $Title, [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
 }
 
+# Multi-line paste box (for pasting many email addresses at once). Returns the text, or $null if cancelled.
+function Show-MultilineInput {
+    param([string]$Title, [string]$Message)
+    Initialize-Gui
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = $Title; $form.StartPosition = 'CenterScreen'
+    $form.Width = 540; $form.Height = 480; $form.TopMost = $true
+    $form.FormBorderStyle = 'FixedDialog'; $form.MaximizeBox = $false; $form.MinimizeBox = $false
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $Message; $lbl.SetBounds(14, 12, 500, 90)
+    $tb = New-Object System.Windows.Forms.TextBox
+    $tb.Multiline = $true; $tb.ScrollBars = 'Vertical'; $tb.AcceptsReturn = $true
+    $tb.SetBounds(14, 108, 500, 280); $tb.Font = New-Object System.Drawing.Font('Consolas', 10)
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = 'OK'; $ok.SetBounds(318, 398, 90, 32); $ok.DialogResult = 'OK'
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'; $cancel.SetBounds(420, 398, 90, 32); $cancel.DialogResult = 'Cancel'
+    $form.Controls.AddRange(@($lbl, $tb, $ok, $cancel))
+    $form.AcceptButton = $null; $form.CancelButton = $cancel
+    if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { return $tb.Text }
+    return $null
+}
+
 # File picker popup for choosing the leavers list
 function Select-InputFile {
     Add-Type -AssemblyName System.Windows.Forms
@@ -585,9 +608,9 @@ function Start-PurgeMode {
     $cands = @($cands | Where-Object { -not $sharedSet.ContainsKey($_.U.UserPrincipalName.ToLower()) })
     if ($cands.Count -eq 0) { Show-Info "All qualifying accounts are protected shared mailboxes. Nothing to delete." 'Nothing to purge'; return }
 
-    # Report before anything is deleted
-    $repPath = Join-Path $PSScriptRoot ("PurgeCandidates_{0:yyyyMMdd_HHmm}.csv" -f (Get-Date))
-    $cands | ForEach-Object {
+    # Report before anything is deleted (Excel)
+    $repPath = Join-Path $PSScriptRoot ("PurgeCandidates_{0:yyyyMMdd_HHmm}.xlsx" -f (Get-Date))
+    $candRows = $cands | ForEach-Object {
         [pscustomobject]@{
             'Name'             = $_.U.DisplayName
             'Account'          = $_.U.UserPrincipalName
@@ -595,7 +618,14 @@ function Start-PurgeMode {
             'Last Sign-In'     = if ($_.Last) { $_.Last.ToString('yyyy-MM-dd') } else { 'never' }
             'Inactive (years)' = [math]::Round(((Get-Date) - $_.Ref).TotalDays / 365.0, 1)
         }
-    } | Export-Csv $repPath -NoTypeInformation -Encoding UTF8
+    }
+    if (Get-Module -ListAvailable ImportExcel) {
+        Import-Module ImportExcel
+        $candRows | Export-Excel $repPath -WorksheetName 'Purge candidates' -TableStyle Medium2 -AutoSize -AutoFilter -BoldTopRow -FreezeTopRow
+    } else {
+        $repPath = [System.IO.Path]::ChangeExtension($repPath, '.csv')
+        $candRows | Export-Csv $repPath -NoTypeInformation -Encoding UTF8
+    }
     Write-Host "Candidate report saved: $repPath" -ForegroundColor Cyan
 
     $choice = Show-Menu 'Ready to purge' "$($cands.Count) stale account(s) qualify for deletion.`n($protectedCount shared-mailbox account(s) were excluded and protected.)`n`nA report of every candidate was saved:`n$repPath`n`nOpen and check it before deleting if you want a record for sign-off." @(
@@ -622,10 +652,136 @@ function Start-PurgeMode {
         }
     }
     if ($deleted.Count -gt 0) {
-        $delPath = Join-Path $PSScriptRoot ("COMMITTED_purge_{0:yyyyMMdd_HHmm}.csv" -f (Get-Date))
-        $deleted | Export-Csv $delPath -NoTypeInformation -Encoding UTF8
+        $delPath = Join-Path $PSScriptRoot ("COMMITTED_purge_{0:yyyyMMdd_HHmm}.xlsx" -f (Get-Date))
+        if (Get-Module -ListAvailable ImportExcel) {
+            Import-Module ImportExcel
+            $deleted | Export-Excel $delPath -WorksheetName 'Deleted' -TableStyle Medium2 -AutoSize -AutoFilter -BoldTopRow -FreezeTopRow
+        } else {
+            $delPath = [System.IO.Path]::ChangeExtension($delPath, '.csv')
+            $deleted | Export-Csv $delPath -NoTypeInformation -Encoding UTF8
+        }
         Show-Info "$($deleted.Count) account(s) deleted.`n`nThey stay restorable for 30 days in the Entra admin center (Users > Deleted users). After that they are gone forever.`n`nRecord saved: $delPath" 'Purge finished'
     }
+}
+
+# ---------- DELETE by pasted email addresses (direct deletion) ----------
+# Paste any number of email addresses; matched CLOUD accounts are deleted (soft-delete: 30-day
+# recycle bin, then gone forever). Hybrid (on-prem synced) accounts are NOT deleted here - they
+# are listed as "fix in local AD". Everything is written to an Excel report.
+function Start-DeleteByEmailMode {
+    $raw = Show-MultilineInput 'DELETE accounts by email' (
+        "Paste the email addresses to DELETE - one per line (commas, semicolons or spaces also work).`n`n" +
+        "WARNING: this PERMANENTLY deletes the matched accounts. They go to Microsoft's recycle bin for 30 days " +
+        "(restorable in Entra admin center > Deleted users), then are gone FOREVER including OneDrive.`n`n" +
+        "Hybrid accounts (synced from on-premises AD) will NOT be deleted here - they must be removed in your local AD.")
+    if (-not $raw) { return }
+
+    $emails = @($raw -split '[\r\n,; ]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '@' } | Select-Object -Unique)
+    if ($emails.Count -eq 0) { Show-Info 'No valid email addresses were found in what you pasted.' 'Nothing to delete'; return }
+
+    Write-Host "Looking up $($emails.Count) address(es)..." -ForegroundColor Cyan
+    $users = Get-AllTenantUsers
+    $byUpn = @{}; $byMail = @{}; $byProxy = @{}
+    foreach ($u in $users) {
+        if ($u.UserPrincipalName) { $byUpn[$u.UserPrincipalName.ToLower()] = $u }
+        if ($u.Mail)             { $byMail[$u.Mail.ToLower()] = $u }
+        foreach ($p in @($u.ProxyAddresses)) { if ($p -match '^smtp:(.+)$') { $byProxy[$Matches[1].ToLower()] = $u } }
+    }
+
+    $toDelete = New-Object System.Collections.Generic.List[object]
+    $hybrid   = New-Object System.Collections.Generic.List[object]
+    $noMatch  = New-Object System.Collections.Generic.List[string]
+    foreach ($e in $emails) {
+        $k = $e.ToLower()
+        $u = $byUpn[$k]; if (-not $u) { $u = $byMail[$k] }; if (-not $u) { $u = $byProxy[$k] }
+        if (-not $u) { $noMatch.Add($e); continue }
+        if ($u.OnPremisesSyncEnabled -eq $true) { $hybrid.Add([pscustomobject]@{ Email = $e; User = $u }); continue }
+        $toDelete.Add([pscustomobject]@{ Email = $e; User = $u })
+    }
+
+    $preview = "Pasted addresses: $($emails.Count)`n`n" +
+               "WILL DELETE (cloud accounts): $($toDelete.Count)`n" +
+               "Hybrid - skipped, fix in local AD: $($hybrid.Count)`n" +
+               "No matching account found: $($noMatch.Count)`n`n" +
+               "This PERMANENTLY deletes the $($toDelete.Count) matched account(s) (30-day recycle bin, then gone forever).`n`n" +
+               "Are you absolutely sure?"
+
+    $results = New-Object System.Collections.Generic.List[object]
+
+    if ($toDelete.Count -eq 0) {
+        Show-Info "$preview`n`nThere is nothing to delete." 'Delete by email'
+    }
+    elseif (Show-Confirm $preview 'CONFIRM PERMANENT DELETE') {
+        $done = 0
+        foreach ($d in $toDelete) {
+            $status = 'DELETED'
+            try {
+                Remove-MgUser -UserId $d.User.Id -ErrorAction Stop
+                $done++
+                Write-Host "  deleted: $($d.User.UserPrincipalName)" -ForegroundColor Green
+                Write-Log "EMAIL-DELETE: $($d.User.UserPrincipalName) ($($d.User.DisplayName))"
+            } catch {
+                $status = "FAILED: $($_.Exception.Message)"
+                Write-Host "  FAILED: $($d.User.UserPrincipalName) -> $($_.Exception.Message)" -ForegroundColor Red
+                Write-Log "EMAIL-DELETE-FAILED: $($d.User.UserPrincipalName) -> $($_.Exception.Message)"
+            }
+            $results.Add([pscustomobject]@{
+                'Pasted Email' = $d.Email
+                'Account'      = $d.User.UserPrincipalName
+                'Display Name' = $d.User.DisplayName
+                'Result'       = $status
+            })
+        }
+        Write-Host "$done account(s) deleted." -ForegroundColor Green
+    }
+    else {
+        Write-Host "Cancelled - nothing was deleted." -ForegroundColor Yellow
+        return
+    }
+
+    # Add hybrid + no-match rows to the same report
+    foreach ($h in $hybrid) {
+        $results.Add([pscustomobject]@{
+            'Pasted Email' = $h.Email
+            'Account'      = $h.User.UserPrincipalName
+            'Display Name' = $h.User.DisplayName
+            'Result'       = 'FAILED - hybrid account (synced from on-premises AD). Must be deleted/disabled in your LOCAL Active Directory, not the cloud.'
+        })
+    }
+    foreach ($n in $noMatch) {
+        $results.Add([pscustomobject]@{ 'Pasted Email' = $n; 'Account' = ''; 'Display Name' = ''; 'Result' = 'NO MATCH - no account found for this email.' })
+    }
+
+    # Excel report
+    $repPath = Join-Path $PSScriptRoot ("COMMITTED_delete_{0:yyyyMMdd_HHmm}.xlsx" -f (Get-Date))
+    if (Get-Module -ListAvailable ImportExcel) {
+        Import-Module ImportExcel
+        $ct = @(
+            New-ConditionalText -Text 'DELETED' -ConditionalTextColor Black -BackgroundColor LightGreen
+            New-ConditionalText -Text 'FAILED'  -ConditionalTextColor White -BackgroundColor Red
+            New-ConditionalText -Text 'NO MATCH' -ConditionalTextColor Black -BackgroundColor Khaki
+        )
+        $pkg = $results | Export-Excel $repPath -WorksheetName 'Deletions' -AutoFilter -FreezeTopRow -BoldTopRow -ConditionalText $ct -PassThru
+        $ws = $pkg.Workbook.Worksheets['Deletions']
+        $w = @(34, 34, 30, 80); for ($c = 1; $c -le $w.Count; $c++) { $ws.Column($c).Width = $w[$c - 1] }
+        $ws.Cells["D2:D$($ws.Dimension.End.Row)"].Style.WrapText = $true
+        Close-ExcelPackage $pkg
+        if ($hybrid.Count -gt 0) {
+            $results | Where-Object { $_.Result -like 'FAILED - hybrid*' } |
+                Export-Excel $repPath -WorksheetName 'Fix in Local AD' -TableStyle Medium6 -AutoSize -AutoFilter -BoldTopRow -FreezeTopRow
+        }
+    } else {
+        $repPath = [System.IO.Path]::ChangeExtension($repPath, '.csv')
+        $results | Export-Csv $repPath -NoTypeInformation -Encoding UTF8
+    }
+
+    $deletedCount = @($results | Where-Object { $_.Result -eq 'DELETED' }).Count
+    Show-Info ("Delete-by-email finished.`n`n" +
+        "Deleted: $deletedCount`n" +
+        "Hybrid (fix in local AD): $($hybrid.Count)`n" +
+        "No match: $($noMatch.Count)`n`n" +
+        "Deleted accounts are restorable for 30 days in the Entra admin center (Users > Deleted users).`n`n" +
+        "Report saved: $repPath") 'Delete by email - done'
 }
 
 # ---------- Undo support: snapshot of an account before we touch it ----------
@@ -993,19 +1149,21 @@ function Start-BulkMode {
 
     function New-Result {
         param($Pupil, $ListName, $Matched, $AccountName, $Left, $Created, $LastSignIn, $Action, $Remarks, $Licenses, $SignInCheck = '')
-        [pscustomobject]@{
-            'Pupil (from your list)'    = $Pupil
-            'Name (from your list)'     = $ListName
-            'Matched Microsoft Account' = $Matched
-            'Account Display Name'      = $AccountName
-            'Leaving Date'              = if ($Left -is [datetime]) { $Left.ToString('yyyy-MM-dd') } elseif ($Left) { "$Left" } else { '' }
-            'Account Created'           = if ($Created) { $Created.ToString('yyyy-MM-dd') } else { '' }
-            'Last Sign-In'              = $LastSignIn
-            'Sign-In Check'             = $SignInCheck
-            'Action'                    = $Action
-            'Remarks (why)'             = $Remarks
-            'Licenses'                  = $Licenses
-        }
+        # Column label follows the mode you chose (Staff vs Student) instead of always saying "Pupil"
+        $who = if ($script:ListType -eq 'Staff') { 'Staff' } else { 'Student' }
+        $o = [ordered]@{}
+        $o["$who (from your list)"]        = $Pupil
+        $o['Name (from your list)']        = $ListName
+        $o['Matched Microsoft Account']    = $Matched
+        $o['Account Display Name']         = $AccountName
+        $o['Leaving Date']                 = if ($Left -is [datetime]) { $Left.ToString('yyyy-MM-dd') } elseif ($Left) { "$Left" } else { '' }
+        $o['Account Created']              = if ($Created) { $Created.ToString('yyyy-MM-dd') } else { '' }
+        $o['Last Sign-In']                 = $LastSignIn
+        $o['Sign-In Check']                = $SignInCheck
+        $o['Action']                       = $Action
+        $o['Remarks (why)']                = $Remarks
+        $o['Licenses']                     = $Licenses
+        [pscustomobject]$o
     }
 
     $results = New-Object System.Collections.Generic.List[object]
@@ -1046,7 +1204,7 @@ function Start-BulkMode {
 
         $found = Find-User -Email $email -Name $name
         if ($found.Count -eq 0) {
-            $results.Add((New-Result $key $name '' '' $left $null '' 'NOT FOUND' 'No Microsoft account matches this pupil. Nothing to do (likely left before accounts existed or already deleted).' ''))
+            $results.Add((New-Result $key $name '' '' $left $null '' 'NOT FOUND' 'No Microsoft account matches this person. Nothing to do (likely left before accounts existed or already deleted).' ''))
             continue
         }
         if ($found.Count -gt 1) {
@@ -1086,27 +1244,26 @@ function Start-BulkMode {
             if (-not $emailMatched) { $note += " Note: the email in your list was not found - matched by NAME instead." }
         }
 
-        # ---- FAILSAFE: student runs must never touch accounts that look like STAFF ----
+        # ---- Your explicit Staff/Student choice is authoritative - no auto-skip based on account type ----
+        # (Account-type mismatches are recorded as an informational note only; nothing is refused.)
         $looksStaff = Test-LooksLikeStaff $u $lics
         if ($script:ListType -eq 'Students' -and $looksStaff) {
             $why = @()
-            if ($lics -match 'Faculty') { $why += 'faculty license' }
+            if ($lics -match 'Faculty') { $why += 'faculty licence' }
             if ($u.JobTitle) { $why += "job title '$($u.JobTitle)'" }
             if ($u.Department) { $why += "department '$($u.Department)'" }
-            $results.Add((New-Result $key $name $u.UserPrincipalName $dn $left $u.CreatedDateTime $seen 'REVIEW - looks like STAFF' "This is a STUDENT run but the account looks like a staff member ($($why -join ', ')). Not touched - if they really are staff, run them through a Staff run instead." $lics))
-            if ($DoCommit) { $reviewList.Add(@{ Idx = $results.Count - 1; User = $u; Key = $key; Name = $name; Left = $left; Seen = $seen; Lics = $lics; Sec = $sec; Inactive = $inactiveTxt }) }
-            continue
+            $note += " Note: this account looks like staff ($($why -join ', ')) but you ran it as a STUDENT - processing as instructed."
         }
-        if ($script:ListType -eq 'Staff' -and -not $looksStaff) {
-            $note += " Note: account has no job title/faculty license - double-check this is really staff."
+        elseif ($script:ListType -eq 'Staff' -and -not $looksStaff) {
+            $note += " Note: account has no job title/faculty licence but you ran it as STAFF - processing as instructed."
         }
 
         # ---- FAILSAFE: account created AFTER the pupil left = recycled address (only when the name differs) ----
         if ($left -is [datetime] -and $u.CreatedDateTime -and $u.CreatedDateTime -gt $left) {
             if ($sameName) {
-                $note = " Note: account created after leaving date, but the name matches your leaver - treated as the same pupil."
+                $note = " Note: account created after leaving date, but the name matches your leaver - treated as the same person."
             } else {
-                $results.Add((New-Result $key $name $u.UserPrincipalName $dn $left $u.CreatedDateTime $seen 'SKIP - new account' "Recycled address: YOUR leaver was '$name' (left $($left.ToString('yyyy-MM-dd'))) but this account was created later and now belongs to '$dn' - a different pupil. Not touched." $lics))
+                $results.Add((New-Result $key $name $u.UserPrincipalName $dn $left $u.CreatedDateTime $seen 'SKIP - new account' "Recycled address: YOUR leaver was '$name' (left $($left.ToString('yyyy-MM-dd'))) but this account was created later and now belongs to '$dn' - a different person. Not touched." $lics))
                 continue
             }
         }
@@ -1224,17 +1381,17 @@ function Start-BulkMode {
 
     if ($DoCommit) { Save-RestoreLog }
 
-    # Commit reports get a COMMITTED_ prefix so the auto-cleanup above can never delete your audit trail
+    # Reports are Excel-only (no CSV). Commit reports get a COMMITTED_ prefix so the
+    # auto-cleanup above can never delete your audit trail.
     $prefix = if ($DoCommit) { 'COMMITTED_result_' } else { 'result_' }
-    $log = Join-Path $outDir ("$prefix{0:yyyyMMdd_HHmm}.csv" -f (Get-Date))
-    $results | Sort-Object 'Action' | Export-Csv $log -NoTypeInformation -Encoding UTF8
+    $xlsx = Join-Path $outDir ("$prefix{0:yyyyMMdd_HHmm}.xlsx" -f (Get-Date))
+    $log  = $xlsx
     $results | Group-Object 'Action' | Select-Object Name, Count | Sort-Object Name | Format-Table -AutoSize
 
     if ($results.Count -gt 0 -and (Get-Module -ListAvailable ImportExcel)) {
         Write-Host "Building the formatted Excel report..." -ForegroundColor Gray
         Write-Progress -Activity "Finishing" -Status "Creating the Excel report..." -PercentComplete 50
         Import-Module ImportExcel
-        $xlsx = [System.IO.Path]::ChangeExtension($log, '.xlsx')
 
         $summary = $results | Group-Object 'Action' | Sort-Object Name | ForEach-Object {
             [pscustomobject]@{ 'Category' = $_.Name; 'Accounts' = $_.Count }
@@ -1256,6 +1413,21 @@ function Start-BulkMode {
             $licRows | Export-Excel $xlsx -WorksheetName 'Licenses to recover' -TableStyle Medium2 -AutoSize
         }
 
+        # ---- Separate sheet: hybrid (on-premises synced) accounts that must be fixed in LOCAL AD ----
+        $hybrid = @($results | Where-Object { "$($_.'Remarks (why)')" -match 'ON-PREMISES|local AD|on-premises' })
+        if ($hybrid.Count -gt 0) {
+            $hybrid | ForEach-Object {
+                [pscustomobject]@{
+                    'Name (from your list)'     = $_.'Name (from your list)'
+                    'Matched Microsoft Account' = $_.'Matched Microsoft Account'
+                    'Account Display Name'      = $_.'Account Display Name'
+                    'Cloud action taken'        = $_.'Action'
+                    'Reason'                    = 'FAILED / INCOMPLETE - hybrid account synced from on-premises AD. Disable, hide and group changes MUST be done in your LOCAL Active Directory (cloud-only changes revert at the next sync).'
+                }
+            } | Export-Excel $xlsx -WorksheetName 'Fix in Local AD' -TableStyle Medium6 -AutoSize -AutoFilter -BoldTopRow -FreezeTopRow
+            Write-Host "$($hybrid.Count) hybrid account(s) listed in the 'Fix in Local AD' sheet." -ForegroundColor Yellow
+        }
+
         $ct = @(
             New-ConditionalText -Text 'WILL PROCESS' -ConditionalTextColor Black -BackgroundColor LightGreen
             New-ConditionalText -Text 'DONE'         -ConditionalTextColor Black -BackgroundColor LightGreen
@@ -1273,6 +1445,13 @@ function Start-BulkMode {
         Write-Progress -Activity "Finishing" -Completed
         Write-Host "Formatted Excel report saved to: $xlsx" -ForegroundColor Green
     }
+    elseif ($results.Count -gt 0) {
+        # Emergency fallback only if the Excel module is somehow unavailable - keeps the audit trail
+        $emergency = [System.IO.Path]::ChangeExtension($xlsx, '.csv')
+        $results | Sort-Object 'Action' | Export-Csv $emergency -NoTypeInformation -Encoding UTF8
+        Write-Host "ImportExcel not available - saved an emergency CSV instead: $emergency" -ForegroundColor Yellow
+        $log = $emergency
+    }
 
     $counts = ($results | Group-Object 'Action' | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ', '
     Write-Log "BULK $(if ($DoCommit) { 'COMMIT' } else { 'DRY-RUN' }) finished. Results: $counts. Report: $(Split-Path $log -Leaf)"
@@ -1288,7 +1467,8 @@ function Start-BulkMode {
     $lines = ($grp.GetEnumerator() | Sort-Object Name | ForEach-Object { "  {0,-28} {1}" -f $_.Name, $_.Value }) -join "`n"
     $kind = if ($DoCommit) { 'COMMIT (real changes made)' } else { 'DRY RUN (nothing changed)' }
     $verb = if ($DoCommit) { 'Licenses removed' } else { 'Licenses that would be recovered' }
-    Show-Info ("$kind`n`nList: $(Split-Path $Path -Leaf)   ($($rows.Count) rows)`n`n$lines`n`n$verb`: $licTotal`n`nFull report: $(Split-Path $log -Leaf)$(if (Test-Path ([System.IO.Path]::ChangeExtension($log,'.xlsx'))) { ' (.xlsx opens in Excel)' })") "Cleanup summary - $kind"
+    $hybridNote = if ($hybrid -and $hybrid.Count -gt 0) { "`n`n$($hybrid.Count) hybrid account(s) need fixing in LOCAL AD - see the 'Fix in Local AD' sheet." } else { '' }
+    Show-Info ("$kind`n`nList: $(Split-Path $Path -Leaf)   ($($rows.Count) rows)`n`n$lines`n`n$verb`: $licTotal$hybridNote`n`nFull Excel report: $(Split-Path $log -Leaf)") "Cleanup summary - $kind"
 }
 
 # ---------- Entry point ----------
@@ -1303,11 +1483,12 @@ else {
             'Individual account  -  look up one person and decide',
             'RESTORE  -  undo a previous cleanup for someone',
             'PURGE stale accounts  -  delete accounts dead for years',
+            'DELETE by email  -  paste email addresses to delete now',
             'Exit')
-        if ($choice -lt 0 -or $choice -eq 5) { return }
+        if ($choice -lt 0 -or $choice -eq 6) { return }
 
         if ($choice -eq 0 -or $choice -eq 1) {
-            $t = Show-Menu 'Who is in this list?' "Choose who you are cleaning up.`n`nSTUDENT runs automatically refuse to touch anything that looks like a staff account.`nSTAFF runs preserve mailboxes (converted to shared) and archive OneDrive." @(
+            $t = Show-Menu 'Who is in this list?' "Choose who you are cleaning up.`n`nYour choice is respected - accounts are processed as instructed (mismatches are noted, not skipped).`nSTAFF runs preserve mailboxes (converted to shared) and archive OneDrive." @(
                 'STUDENTS  -  standard cleanup',
                 'STAFF  -  extra care: keep email + archive OneDrive')
             if ($t -lt 0) { continue }
@@ -1332,7 +1513,7 @@ else {
                     $script:cfg.ArchiveSiteUrl = "$au".Trim()
                     if ($script:cfg.ArchiveSiteUrl) { Save-Config }
                 }
-                $what = if ($script:StaffMode) { "STAFF cleanup:`n- disable sign-in`n- convert mailbox to shared (email kept forever)`n- archive OneDrive`n- remove groups + hide from address book`n- remove licenses" } else { "STUDENT cleanup:`n- disable sign-in`n- remove groups + hide from address book`n- remove licenses`n- accounts that look like staff are skipped" }
+                $what = if ($script:StaffMode) { "STAFF cleanup:`n- disable sign-in`n- convert mailbox to shared (email kept forever)`n- archive OneDrive`n- remove groups + hide from address book`n- remove licenses" } else { "STUDENT cleanup:`n- disable sign-in`n- remove groups + hide from address book`n- remove licenses" }
                 if (Show-Confirm "$what`n`nList: $(Split-Path $p -Leaf)`n`nThis makes REAL changes. An undo file is saved first. Continue?" 'Confirm commit') {
                     Start-BulkMode -Path $p -DoCommit $true
                 } else { Write-Host "Cancelled." }
@@ -1341,5 +1522,6 @@ else {
         elseif ($choice -eq 2) { Start-IndividualMode }
         elseif ($choice -eq 3) { Start-RestoreMode }
         elseif ($choice -eq 4) { Start-PurgeMode }
+        elseif ($choice -eq 5) { Start-DeleteByEmailMode }
     }
 }
