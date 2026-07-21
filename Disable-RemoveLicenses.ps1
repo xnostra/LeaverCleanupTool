@@ -142,7 +142,7 @@ if (-not $NoSelfUpdate -and -not $Updated) {
 }
 
 # ---------- Version ----------
-$script:ToolVersion = '1.0'
+$script:ToolVersion = '1.1'
 
 # ---------- Automatic log file (a permanent, dated history of every run) ----------
 $script:LogFile = Join-Path $PSScriptRoot ("Log_{0:yyyyMM}.log" -f (Get-Date))
@@ -593,7 +593,14 @@ function Get-AllTenantUsers {
     $allUsers = $null
     if (-not $ForceRefresh -and -not $RefreshUserCache -and (Test-Path $cacheFile) -and ((Get-Date) - (Get-Item $cacheFile).LastWriteTime).TotalHours -lt 4) {
         Write-Host "Using cached user list from $((Get-Item $cacheFile).LastWriteTime.ToString('HH:mm')) (use -RefreshUserCache for a fresh one)..."
-        $allUsers = Import-Clixml $cacheFile
+        # If you're running Students and Staff at the same time in two windows, they share this
+        # cache. Reading it can very rarely land mid-write by the other window - if so, this just
+        # falls back to a fresh download instead of crashing (this used to be able to corrupt the
+        # cache and fail with an XML parse error - now it can't).
+        try { $allUsers = Import-Clixml $cacheFile -ErrorAction Stop } catch {
+            Write-Host "Cached user list could not be read (likely being refreshed by another window right now) - downloading fresh instead." -ForegroundColor Yellow
+            $allUsers = $null
+        }
     }
     if (-not $allUsers) {
         Write-Host "Downloading all users from Microsoft 365 (slow, but cached for 4 hours afterwards)..." -ForegroundColor Gray
@@ -601,7 +608,15 @@ function Get-AllTenantUsers {
         $props = "Id,DisplayName,UserPrincipalName,Mail,ProxyAddresses,AccountEnabled,AssignedLicenses,CreatedDateTime,SignInActivity,JobTitle,Department,OnPremisesSyncEnabled"
         $allUsers = Get-MgUser -All -PageSize 999 -Property $props
         Write-Progress -Activity "Downloading directory" -Status "Saving a local copy for faster re-runs..." -PercentComplete 90
-        try { $allUsers | Export-Clixml $cacheFile } catch { }
+        try {
+            # Write to a temp file, then rename it into place. A rename is atomic on Windows, so a
+            # second window reading the cache at the same time (Students + Staff running together)
+            # always sees either the complete old file or the complete new one - never a half-written
+            # one, which is what used to cause the corrupted-cache crash.
+            $tmpCacheFile = "$cacheFile.$PID.tmp"
+            $allUsers | Export-Clixml $tmpCacheFile
+            Move-Item -Path $tmpCacheFile -Destination $cacheFile -Force
+        } catch { }
         Write-Progress -Activity "Downloading directory" -Completed
     }
     return $allUsers

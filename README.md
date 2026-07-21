@@ -4,6 +4,12 @@ A menu-driven PowerShell tool for safely offboarding leavers (students or staff)
 
 Built for schools and organisations that offboard people in batches (e.g., end of term/year) with heavy emphasis on **safety**: dry-run preview, undo files for every run, and automatic protection against touching the wrong accounts.
 
+### What's new in v1.1
+- Group-based license removal (see Features below)
+- Much faster sign-in checks on large lists (batched instead of one-by-one)
+- Auto-detects the real header row in spreadsheets that have a title row above it
+- The one-liner launcher now verifies it actually relaunched successfully before trusting it, instead of silently doing nothing on systems that can't drop admin rights
+
 ## Quick Start
 
 **Option A — One-liner (installs to `Desktop\LeaverCleanupTool` and launches):**
@@ -51,6 +57,35 @@ For command-line execution:
 
 ✅ **Self-Installing** — Installs required modules on first run; auto-detects and handles elevated windows
 
+✅ **Group-Based License Removal** — If a leaver's license comes from group membership (not assigned directly), the tool detects which group is granting it and removes them from that group automatically, instead of just reporting that it couldn't remove the license
+
+✅ **Fast on Large Lists** — Sign-in security checks for hundreds of leavers are fetched in batches (up to 20 people per request) instead of one at a time, so a large end-of-year list finishes in a fraction of the time
+
+✅ **Smart Header Detection** — If your spreadsheet has a title row above the real column headers (common in school exports), the tool finds the real header row automatically instead of failing to match anyone
+
+---
+
+## Speed & running Students + Staff side by side
+
+Two things make large lists fast:
+
+- **Batched sign-in checks** — instead of one network request per person, the tool asks Microsoft for up to 20 people's sign-in history at once. This is what actually makes a 300+ person list fast, safely, using Microsoft's own supported batching feature.
+- **A 4-hour cache of your tenant's full user list** — shared between runs (and between Student/Staff windows) so you're not re-downloading thousands of accounts every time.
+
+We deliberately did **not** add raw multi-threaded account changes (disabling, license/group removal, mailbox conversion happening for several people at once). Exchange Online only allows a small number of simultaneous connections per admin, and Microsoft will throttle or error out under heavy parallel writes — that would risk partially-completed cleanups, which is worse than a few extra minutes of runtime.
+
+**Want to run Students and Staff at the same time?** Just open two PowerShell windows and run one in each:
+
+```powershell
+# Window 1
+.\Disable-RemoveLicenses.ps1 -CsvPath .\students.csv -Commit
+
+# Window 2 (at the same time)
+.\Disable-RemoveLicenses.ps1 -CsvPath .\staff.csv -StaffMode -Commit
+```
+
+This is safe — each window writes its own report, undo file, and log entries. The shared 4-hour user-list cache is written safely (temp file + atomic rename) so one window refreshing it can never corrupt what the other window is reading.
+
 ---
 
 ## Requirements
@@ -59,7 +94,7 @@ For command-line execution:
 - A **Microsoft 365 Global Administrator** account (this is a cloud admin role — not local PC admin).
 - Internet access to install modules on first run: `Microsoft.Graph.*`, `ExchangeOnlineManagement` (pinned to 3.4.0), `Microsoft.Online.SharePoint.PowerShell`, `ImportExcel`.
 
-> **Do not run as administrator.** Elevated windows break the Microsoft sign-in. The tool detects this and relaunches itself as a normal user.
+> **Prefer a normal (non-administrator) window.** Elevated windows can break the Microsoft sign-in. The tool detects an elevated window and tries to relaunch itself as your normal user. If your system can't actually drop admin rights (some locked-down or always-elevated setups), it now verifies that before trusting it, and falls back to just running the tool right there instead of silently doing nothing.
 
 ---
 
