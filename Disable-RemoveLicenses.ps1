@@ -390,7 +390,7 @@ function Show-Menu {
     $form.Text = $Title
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedDialog'
-    $form.MaximizeBox = $false; $form.MinimizeBox = $false; $form.TopMost = $true
+    $form.MaximizeBox = $false; $form.MinimizeBox = $true; $form.TopMost = $true
     $form.AutoSize = $true; $form.AutoSizeMode = 'GrowAndShrink'
     $form.Padding = New-Object System.Windows.Forms.Padding(18)
     $form.Tag = -1
@@ -474,6 +474,65 @@ function Get-SignInSecurity($UserId) {
     if ($fails -ge 3)         { $parts += "ALERT - $fails failed sign-in attempts" }
     if ($parts.Count -eq 0)   { return "OK - safe countries only ($($logs.Count) recent sign-ins, $fails failed)" }
     return ($parts -join '; ')
+}
+
+# Turns one Graph sign-in log response (already fetched by the batch call below) into the same
+# summary string Get-SignInSecurity produces, without making its own network call.
+function ConvertTo-SignInSecuritySummary($Logs) {
+    $logs = @($Logs)
+    if ($logs.Count -eq 0) { return '' }
+    $fails     = @($logs | Where-Object { $_.status.errorCode -ne 0 }).Count
+    $countries = @($logs | ForEach-Object { $_.location.countryOrRegion } | Where-Object { $_ } | Select-Object -Unique)
+    $foreign   = @($countries | Where-Object { $SafeCountries -notcontains $_ })
+    $parts = @()
+    if ($foreign.Count -gt 0) { $parts += "ALERT - sign-ins from outside your safe countries ($($SafeCountries -join ',')): $($foreign -join ', ')" }
+    if ($fails -ge 3)         { $parts += "ALERT - $fails failed sign-in attempts" }
+    if ($parts.Count -eq 0)   { return "OK - safe countries only ($($logs.Count) recent sign-ins, $fails failed)" }
+    return ($parts -join '; ')
+}
+
+# ---------- Batched sign-in checks (speeds up large lists a lot) ----------
+# Instead of one network round-trip per person (slow for lists of hundreds), this asks Microsoft
+# Graph's official "$batch" endpoint for up to 20 people's sign-in logs in a single call.
+# Same connection, same sign-in, nothing new to authenticate - just far fewer, bigger requests.
+# If a batch call fails for any reason, those user(s) are simply left out of the map, and the
+# normal one-by-one Get-SignInSecurity is used for them instead - so this can only ever speed
+# things up, never cause a missed or wrong check.
+function Get-SignInSecurityBatch {
+    param([string[]]$UserIds)
+    $resultMap = @{}
+    $ids = @($UserIds | Where-Object { $_ } | Select-Object -Unique)
+    if ($ids.Count -eq 0) { return $resultMap }
+
+    $chunkSize = 20   # Microsoft Graph's limit per $batch call
+    for ($i = 0; $i -lt $ids.Count; $i += $chunkSize) {
+        $lastIdx = [math]::Min($i + $chunkSize - 1, $ids.Count - 1)
+        $chunk = @($ids[$i..$lastIdx])
+        $requests = @()
+        for ($j = 0; $j -lt $chunk.Count; $j++) {
+            $filterVal = "userId eq '$($chunk[$j])'"
+            $encFilter = [uri]::EscapeDataString($filterVal)
+            $requests += @{ id = "$j"; method = 'GET'; url = "/auditLogs/signIns?`$filter=$encFilter&`$top=30" }
+        }
+        $bodyJson = (@{ requests = $requests } | ConvertTo-Json -Depth 8)
+        try {
+            $resp = Invoke-MgGraphRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/$batch' -Body $bodyJson -ContentType 'application/json' -ErrorAction Stop
+            foreach ($r in $resp.responses) {
+                $idx = [int]$r.id
+                if ($idx -lt 0 -or $idx -ge $chunk.Count) { continue }
+                $uid = $chunk[$idx]
+                if ($r.status -eq 200 -and $r.body -and $r.body.value) {
+                    $resultMap[$uid] = ConvertTo-SignInSecuritySummary $r.body.value
+                } elseif ($r.status -eq 200) {
+                    $resultMap[$uid] = ''
+                }
+                # any non-200 status: leave unset so the caller falls back to the live per-user check
+            }
+        } catch {
+            # whole batch failed - leave this chunk's IDs unset, caller falls back automatically
+        }
+    }
+    return $resultMap
 }
 
 # Copy a leaver's entire OneDrive into the archive SharePoint site (server-side, nothing downloads locally)
@@ -656,6 +715,43 @@ function Save-RestoreLog {
     $script:restoreLog.Clear()
 }
 
+# ---------- Group-based license detection (cached per run - the tenant's license-assigning groups rarely change) ----------
+# Builds a one-time lookup of every group in the tenant that has a license attached, so we can match
+# a leaver's group memberships against it without querying every group each time.
+$script:licenseGroupCache = $null
+function Get-LicenseAssigningGroupCache {
+    if ($null -ne $script:licenseGroupCache) { return $script:licenseGroupCache }
+    $script:licenseGroupCache = @{}
+    try {
+        $groups = Get-MgGroup -All -Property "id,displayName,assignedLicenses" -ErrorAction Stop
+        foreach ($g in $groups) {
+            if ($g.AssignedLicenses -and $g.AssignedLicenses.Count -gt 0) {
+                $script:licenseGroupCache[$g.Id] = [pscustomobject]@{
+                    Id       = $g.Id
+                    Name     = $g.DisplayName
+                    Licenses = Get-LicNames @($g.AssignedLicenses.SkuId | Where-Object { $_ })
+                }
+            }
+        }
+    } catch {
+        Write-Host "    ! Could not build the license-group lookup: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+    return $script:licenseGroupCache
+}
+
+# Given a user's group memberships (already fetched), returns which of them assign a license
+function Find-LicenseAssigningGroups {
+    param($UserGroups)
+    $cache = Get-LicenseAssigningGroupCache
+    $foundGroups = @()
+    if ($UserGroups) {
+        foreach ($ug in $UserGroups) {
+            if ($cache.ContainsKey($ug.Id)) { $foundGroups += $cache[$ug.Id] }
+        }
+    }
+    return $foundGroups
+}
+
 # ---------- The actual cleanup of one account ----------
 # Disables, removes groups/DLs, hides from address book, removes licenses. Returns a remarks string.
 function Invoke-AccountCleanup {
@@ -764,7 +860,27 @@ function Invoke-AccountCleanup {
         } catch {
             $msg = "$($_.Exception.Message)"
             if ($msg -match 'group|does not have a corresponding license') {
-                $done += "license is GROUP-BASED (assigned via a group, not directly) - cannot be removed directly, but the user was removed from their groups above so the license drops off automatically"
+                Write-Host "    - license is GROUP-BASED, checking which group is assigning it..." -ForegroundColor Gray
+                $licGroups = @(Find-LicenseAssigningGroups -UserGroups $allGroups)
+                if ($licGroups.Count -gt 0) {
+                    $removedNames = @()
+                    foreach ($lg in $licGroups) {
+                        try {
+                            Remove-MgGroupMemberByRef -GroupId $lg.Id -DirectoryObjectId $User.Id -ErrorAction Stop
+                            Write-Host "      removed from license group: $($lg.Name)  ($($lg.Licenses))" -ForegroundColor Green
+                            $removedNames += $lg.Name
+                        } catch {
+                            Write-Host "      could not remove from $($lg.Name): $($_.Exception.Message)" -ForegroundColor Yellow
+                        }
+                    }
+                    if ($removedNames.Count -gt 0) {
+                        $done += "license was GROUP-BASED - auto-removed from license-assigning group(s): $($removedNames -join ', ')"
+                    } else {
+                        $done += "license is GROUP-BASED (via $($licGroups.Count) group(s): $(($licGroups | ForEach-Object { $_.Name }) -join ', ')) - removal from those group(s) FAILED, check permissions"
+                    }
+                } else {
+                    $done += "license is GROUP-BASED (assigned via a group, not directly) - could not identify which group; it was removed from all its groups above, so the license should drop off automatically"
+                }
             } else {
                 $done += "license NOT removed: $msg"
             }
@@ -915,7 +1031,23 @@ function Start-BulkMode {
     }
     if ($Path -like '*.xlsx') {
         Import-Module ImportExcel
-        $rows = @(Import-Excel $Path)
+        # Some exports have a title row above the real headers (e.g. "Leavers Staff List - 2025"
+        # as row 1, with the actual "Name / Email / ..." headers on row 2). Peek at the first few
+        # rows with no header assumed, and use whichever one actually looks like column headers -
+        # multiple short text cells, ideally matching things like email/name/leaving date.
+        $headerRow = 1
+        try {
+            $rawPeek = @(Import-Excel $Path -NoHeader -StartRow 1 -ErrorAction Stop | Select-Object -First 10)
+            for ($ri = 0; $ri -lt $rawPeek.Count; $ri++) {
+                $cells = @($rawPeek[$ri].psobject.Properties | ForEach-Object { "$($_.Value)".Trim() } | Where-Object { $_ })
+                if ($cells.Count -ge 2 -and -not ($cells | Where-Object { $_.Length -gt 40 })) {
+                    $keywordHit = @($cells | Where-Object { $_ -match 'e-?mail|name|leav|left|exit|staff|student|pupil|forename|surname' }).Count -gt 0
+                    if ($keywordHit -or $cells.Count -ge 3) { $headerRow = $ri + 1; break }
+                }
+            }
+        } catch { $headerRow = 1 }   # peek failed for any reason - fall back to the normal "row 1 is the header" behaviour
+        $rows = @(Import-Excel $Path -StartRow $headerRow)
+        if ($headerRow -gt 1) { Write-Host "Note: row 1 looked like a title, not headers - used row $headerRow as the real header row instead." -ForegroundColor Cyan }
     } else {
         $rows = @(Import-Csv $Path)
     }
@@ -1026,6 +1158,31 @@ function Start-BulkMode {
         $o['Remarks (why)']                = $Remarks
         $o['Licenses']                     = $Licenses
         [pscustomobject]$o
+    }
+
+    # ---- Pre-fetch sign-in security checks in batches (big speed-up for large lists) ----
+    # Does a quick first pass just to work out who in the list matches a real account, then asks
+    # Microsoft Graph for all of their sign-in histories a batch at a time (up to 20 per call)
+    # instead of one-by-one. The main loop below uses these pre-fetched results if available,
+    # and falls back to the normal one-by-one check for anyone missed - so this is a pure speed
+    # optimisation and cannot change what gets flagged or skipped.
+    $script:secBatchMap = @{}
+    if ($SecCheck) {
+        Write-Host "Pre-checking sign-in security for your list (batched - much faster than one-by-one)..." -ForegroundColor Gray
+        $candidateIds = New-Object System.Collections.Generic.List[string]
+        foreach ($preRow in $rows) {
+            $preEmail = if ($emailCol -and $preRow.$emailCol) { "$($preRow.$emailCol)".Trim() } else { '' }
+            $preName  = ''
+            if ($nameCol -and $preRow.$nameCol) { $preName = "$($preRow.$nameCol)".Trim() }
+            elseif ($foreCol -and $surCol)      { $preName = ("$($preRow.$foreCol) $($preRow.$surCol)").Trim() }
+            if (-not $preEmail -and -not $preName) { continue }
+            $preFound = Find-User -Email $preEmail -Name $preName
+            if ($preFound.Count -eq 1 -and $preFound[0].Id) { $candidateIds.Add($preFound[0].Id) }
+        }
+        if ($candidateIds.Count -gt 0) {
+            $script:secBatchMap = Get-SignInSecurityBatch -UserIds $candidateIds
+            Write-Host "Batched sign-in check complete for $($script:secBatchMap.Count) of $($candidateIds.Count) account(s) (any remainder uses the normal per-account check automatically)." -ForegroundColor Gray
+        }
     }
 
     $results = New-Object System.Collections.Generic.List[object]
@@ -1149,9 +1306,14 @@ function Start-BulkMode {
             $note += " Note: list name '$name' differs from account name '$dn' - cleaned anyway because it was in your approved list."
         }
 
-        # Sign-in security check (logs only go back ~30 days)
+        # Sign-in security check (logs only go back ~30 days). Uses the pre-fetched batch result
+        # if we have one (fast); otherwise falls back to the normal one-by-one live check.
         if ($SecCheck -and $lastSignIn -and $lastSignIn -gt (Get-Date).ToUniversalTime().AddDays(-30)) {
-            $sec = Get-SignInSecurity $u.Id
+            if ($script:secBatchMap.ContainsKey($u.Id)) {
+                $sec = $script:secBatchMap[$u.Id]
+            } else {
+                $sec = Get-SignInSecurity $u.Id
+            }
         }
 
         # ---- FAILSAFE: recently active ----
