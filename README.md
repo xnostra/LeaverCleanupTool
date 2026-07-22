@@ -5,7 +5,9 @@ A menu-driven PowerShell tool for safely offboarding leavers (students or staff)
 Built for schools and organisations that offboard people in batches (e.g., end of term/year) with heavy emphasis on **safety**: dry-run preview, undo files for every run, and automatic protection against touching the wrong accounts.
 
 ### What's new in v1.1
-- Group-based license removal (see Features below)
+- Group-based license removal (see Features below), including licenses assigned via a **nested** group (a group the person belongs to indirectly, through another group)
+- When a license-assigning group can't be removed (permissions, or it's synced from on-premises AD), the report now says exactly why instead of a generic "check permissions"
+- OneDrive archiving no longer creates duplicate "Name (1)", "file (2).docx" copies if an account gets processed more than once - it reuses the existing archive folder and skips files already copied
 - Much faster sign-in checks on large lists (batched instead of one-by-one)
 - Auto-detects the real header row in spreadsheets that have a title row above it
 - The one-liner launcher now verifies it actually relaunched successfully before trusting it, instead of silently doing nothing on systems that can't drop admin rights
@@ -57,7 +59,9 @@ For command-line execution:
 
 ✅ **Self-Installing** — Installs required modules on first run; auto-detects and handles elevated windows
 
-✅ **Group-Based License Removal** — If a leaver's license comes from group membership (not assigned directly), the tool detects which group is granting it and removes them from that group automatically, instead of just reporting that it couldn't remove the license
+✅ **Group-Based License Removal** — If a leaver's license comes from group membership (not assigned directly), the tool detects which group is granting it - checking nested/indirect group membership too - and removes them from that group automatically. If it can't (permissions, or the group is synced from on-premises AD), it tells you exactly why
+
+✅ **No Duplicate OneDrive Archives** — If an account gets processed more than once, the tool reuses the existing archive folder and skips files already copied there, instead of creating "Name (1)", "file (2).docx" duplicates
 
 ✅ **Fast on Large Lists** — Sign-in security checks for hundreds of leavers are fetched in batches (up to 20 people per request) instead of one at a time, so a large end-of-year list finishes in a fraction of the time
 

@@ -564,22 +564,57 @@ function Copy-OneDriveToArchive {
         }
         if ($items.Count -eq 0) { return 'OneDrive is empty - nothing to archive' }
 
-        # 3) Destination: a folder named after the leaver in the archive site's document library
+        # 3) Destination: a folder named after the leaver in the archive site's document library.
+        #    Reuse an existing folder for this person if one is already there (e.g. this account was
+        #    processed on a previous run) instead of creating a second "Name (1)" copy - that's what
+        #    used to cause duplicate archive folders to pile up.
         $sitePath  = ([uri]$ArchiveUrl).AbsolutePath
         $site      = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/sites/${spHost}:$sitePath"
         $destDrive = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/sites/$($site.id)/drive"
         $folderName = "$($User.DisplayName) ($(($User.UserPrincipalName -split '@')[0]))"
-        $folderBody = @{ name = $folderName; folder = @{}; '@microsoft.graph.conflictBehavior' = 'rename' } | ConvertTo-Json
-        $folder = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/drives/$($destDrive.id)/root/children" -Body $folderBody -ContentType 'application/json'
 
-        # 4) Kick off server-side copies (Microsoft finishes them in the background)
+        $folder = $null
+        try {
+            $encName = [uri]::EscapeDataString($folderName)
+            $existingFolder = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/drives/$($destDrive.id)/root:/${encName}" -ErrorAction Stop
+            if ($existingFolder.folder) { $folder = $existingFolder }   # only reuse it if it's actually a folder
+        } catch { }   # not found is the normal case for a first-time archive - fall through to create it
+
+        $reusedFolder = [bool]$folder
+        if (-not $folder) {
+            $folderBody = @{ name = $folderName; folder = @{}; '@microsoft.graph.conflictBehavior' = 'rename' } | ConvertTo-Json
+            $folder = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/drives/$($destDrive.id)/root/children" -Body $folderBody -ContentType 'application/json'
+        }
+
+        # If reusing an existing folder, see what's already in it so files copied on a previous run
+        # aren't copied again - that's what used to cause "file (1).docx", "file (2).docx" duplicates.
+        $existingNames = @{}
+        if ($reusedFolder) {
+            try {
+                $existingItems = @()
+                $enext = "https://graph.microsoft.com/v1.0/drives/$($destDrive.id)/items/$($folder.id)/children"
+                while ($enext) {
+                    $eresp = Invoke-MgGraphRequest -Method GET -Uri $enext
+                    $existingItems += $eresp.value
+                    $enext = $eresp.'@odata.nextLink'
+                }
+                foreach ($ei in $existingItems) { $existingNames["$($ei.name)|$($ei.size)"] = $true }
+            } catch { }
+        }
+
+        # 4) Kick off server-side copies (Microsoft finishes them in the background) - skip anything
+        #    that's already there (same name and size) from a previous run of this same account.
         $n = 0
+        $skipped = 0
         foreach ($it in $items) {
+            $key = "$($it.name)|$($it.size)"
+            if ($existingNames.ContainsKey($key)) { $skipped++; continue }
             $body = @{ parentReference = @{ driveId = $destDrive.id; id = $folder.id }; '@microsoft.graph.conflictBehavior' = 'rename' } | ConvertTo-Json
             Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/drives/$($drive.id)/items/$($it.id)/copy" -Body $body -ContentType 'application/json' | Out-Null
             $n++
         }
-        return "OneDrive archived: $n item(s) copying to folder '$folderName' in the archive site (completes by itself in the background)"
+        $skipNote = if ($skipped -gt 0) { " ($skipped item(s) already archived from a previous run, skipped)" } else { '' }
+        return "OneDrive archived: $n item(s) copying to folder '$folderName' in the archive site (completes by itself in the background)$skipNote"
     }
     catch {
         return "OneDrive NOT auto-archived ($($_.Exception.Message)) - copy manually within 93 days"
@@ -748,15 +783,20 @@ function Get-LicenseAssigningGroupCache {
                 }
             }
         }
+        Write-Host "    (found $($script:licenseGroupCache.Count) license-assigning group(s) in your tenant)" -ForegroundColor DarkGray
     } catch {
         Write-Host "    ! Could not build the license-group lookup: $($_.Exception.Message)" -ForegroundColor Yellow
     }
     return $script:licenseGroupCache
 }
 
-# Given a user's group memberships (already fetched), returns which of them assign a license
+# Given a user's group memberships, returns which of them assign a license. Checks the user's
+# DIRECT groups first (fast, no extra API call). If none of those match, the license may be coming
+# from a NESTED group - a group the user only belongs to indirectly (member of Group A, and Group A
+# is itself a member of Group B, which holds the license). Direct membership alone misses that, so
+# as a fallback we check the user's full transitive membership too before giving up.
 function Find-LicenseAssigningGroups {
-    param($UserGroups)
+    param($UserId, $UserGroups)
     $cache = Get-LicenseAssigningGroupCache
     $foundGroups = @()
     if ($UserGroups) {
@@ -764,7 +804,19 @@ function Find-LicenseAssigningGroups {
             if ($cache.ContainsKey($ug.Id)) { $foundGroups += $cache[$ug.Id] }
         }
     }
-    return $foundGroups
+    if ($foundGroups.Count -eq 0 -and $UserId) {
+        try {
+            $transitive = @(Get-MgUserTransitiveMemberOf -UserId $UserId -All -ErrorAction Stop |
+                            Where-Object { $_.AdditionalProperties.'@odata.type' -eq '#microsoft.graph.group' })
+            foreach ($tg in $transitive) {
+                if ($cache.ContainsKey($tg.Id)) { $foundGroups += $cache[$tg.Id] }
+            }
+            if ($foundGroups.Count -gt 0) {
+                Write-Host "      (found via a NESTED group - not a direct membership)" -ForegroundColor DarkGray
+            }
+        } catch { }
+    }
+    return @($foundGroups | Select-Object -Unique)
 }
 
 # ---------- The actual cleanup of one account ----------
@@ -876,25 +928,38 @@ function Invoke-AccountCleanup {
             $msg = "$($_.Exception.Message)"
             if ($msg -match 'group|does not have a corresponding license') {
                 Write-Host "    - license is GROUP-BASED, checking which group is assigning it..." -ForegroundColor Gray
-                $licGroups = @(Find-LicenseAssigningGroups -UserGroups $allGroups)
+                $licGroups = @(Find-LicenseAssigningGroups -UserId $User.Id -UserGroups $allGroups)
                 if ($licGroups.Count -gt 0) {
                     $removedNames = @()
+                    $failedNotes  = @()
                     foreach ($lg in $licGroups) {
                         try {
                             Remove-MgGroupMemberByRef -GroupId $lg.Id -DirectoryObjectId $User.Id -ErrorAction Stop
                             Write-Host "      removed from license group: $($lg.Name)  ($($lg.Licenses))" -ForegroundColor Green
                             $removedNames += $lg.Name
                         } catch {
-                            Write-Host "      could not remove from $($lg.Name): $($_.Exception.Message)" -ForegroundColor Yellow
+                            $gmsg = "$($_.Exception.Message)"
+                            Write-Host "      could not remove from $($lg.Name): $gmsg" -ForegroundColor Yellow
+                            # Give a specific reason where we can recognise it, instead of a bare "check permissions"
+                            if ($gmsg -match 'on-premises|write scope|being synchronized') {
+                                $failedNotes += "$($lg.Name) (this group is SYNCED FROM ON-PREMISES AD - membership must be changed there, not in the cloud)"
+                            } elseif ($gmsg -match 'role-assignable|isAssignableToRole|privileged') {
+                                $failedNotes += "$($lg.Name) (this is a role-assignable/privileged group - removing members needs a higher-privilege role than this tool signs in with)"
+                            } elseif ($gmsg -match 'Authorization_RequestDenied|Forbidden|insufficient privileges') {
+                                $failedNotes += "$($lg.Name) (permission denied: $gmsg)"
+                            } else {
+                                $failedNotes += "$($lg.Name) ($gmsg)"
+                            }
                         }
                     }
                     if ($removedNames.Count -gt 0) {
                         $done += "license was GROUP-BASED - auto-removed from license-assigning group(s): $($removedNames -join ', ')"
-                    } else {
-                        $done += "license is GROUP-BASED (via $($licGroups.Count) group(s): $(($licGroups | ForEach-Object { $_.Name }) -join ', ')) - removal from those group(s) FAILED, check permissions"
+                    }
+                    if ($failedNotes.Count -gt 0) {
+                        $done += "could NOT remove from license-assigning group(s): $($failedNotes -join '; ')"
                     }
                 } else {
-                    $done += "license is GROUP-BASED (assigned via a group, not directly) - could not identify which group; it was removed from all its groups above, so the license should drop off automatically"
+                    $done += "license is GROUP-BASED (assigned via a group, not directly) - could not identify which group even after checking nested memberships; it was removed from all its known groups above, so the license should still drop off automatically"
                 }
             } else {
                 $done += "license NOT removed: $msg"
