@@ -9,17 +9,17 @@
     between runs — running from a temporary folder would lose your safety net.
 
     Run with:
-    irm https://raw.githubusercontent.com/xnostra/LeaverCleanupTool/main/invoke-leaver.ps1 | iex
+    irm https://raw.githubusercontent.com/xnostra/Sherborne-Leaver-Cleanup-Tool/main/invoke-leaver.ps1 | iex
 
 .NOTES
     Version: 1.0
     LastModified: 2026-07-20
 
 .LINK
-    https://github.com/xnostra/LeaverCleanupTool
+    https://github.com/xnostra/Sherborne-Leaver-Cleanup-Tool
 #>
 
-$repoRaw    = "https://raw.githubusercontent.com/xnostra/LeaverCleanupTool/main"
+$repoRaw    = "https://raw.githubusercontent.com/xnostra/Sherborne-Leaver-Cleanup-Tool/main"
 $scriptUrl  = "$repoRaw/Disable-RemoveLicenses.ps1"
 
 # Permanent install folder so undo files, logs, and config persist

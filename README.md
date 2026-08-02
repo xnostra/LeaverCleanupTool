@@ -17,7 +17,7 @@ Built for schools and organisations that offboard people in batches (e.g., end o
 **Option A — One-liner (installs to `Desktop\LeaverCleanupTool` and launches):**
 
 ```powershell
-irm https://raw.githubusercontent.com/xnostra/LeaverCleanupTool/main/invoke-leaver.ps1 | iex
+irm https://raw.githubusercontent.com/xnostra/Sherborne-Leaver-Cleanup-Tool/main/invoke-leaver.ps1 | iex
 ```
 
 > Works from **either a normal or an Administrator** PowerShell window — if it detects admin, it automatically relaunches the tool as your normal user (required for Microsoft sign-in) via a one-off scheduled task. The tool installs into a permanent folder on your Desktop so undo files, logs, and config persist between runs. Re-running the one-liner updates the tool in place.
