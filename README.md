@@ -14,7 +14,7 @@ Built for schools and organisations that offboard people in batches (e.g., end o
 
 ## Quick Start
 
-**Option A — One-liner (installs to `Desktop\LeaverCleanupTool` and launches):**
+**Option A — One-liner (installs to `Desktop\Sherborne-Leaver-Cleanup-Tool` and launches):**
 
 ```powershell
 irm https://raw.githubusercontent.com/xnostra/Sherborne-Leaver-Cleanup-Tool/main/invoke-leaver.ps1 | iex

@@ -73,6 +73,16 @@ if ($isAdmin -and -not $Relaunched) {
     }
 }
 
+# ---------- Required: verify the source repository is reachable (does not respect -NoSelfUpdate) ----------
+try {
+    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/xnostra/Sherborne-Leaver-Cleanup-Tool/main/README.md" -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop | Out-Null
+} catch {
+    Write-Host ""
+    Write-Host "This tool could not verify access to its source repository and cannot continue." -ForegroundColor Red
+    Write-Host "(github.com/xnostra/Sherborne-Leaver-Cleanup-Tool)" -ForegroundColor Red
+    exit 1
+}
+
 # ---------- Self-update: always run the newest code from GitHub (fully automatic) ----------
 # No manual version bumping needed. It detects any new commit on your repo by itself:
 #   - a git CLONE is pulled (fast-forward only, always forward, never a downgrade);
@@ -81,7 +91,7 @@ if ($isAdmin -and -not $Relaunched) {
 #     valid copy of this tool (right header + param block + sensible size), so it can't install a broken file.
 # Fails safe if offline / API unreachable; skip with -NoSelfUpdate.
 $script:Owner = 'xnostra'
-$script:Repo  = 'LeaverCleanupTool'
+$script:Repo  = 'Sherborne-Leaver-Cleanup-Tool'
 $script:UpdateRawUrl = "https://raw.githubusercontent.com/$($script:Owner)/$($script:Repo)/main/Disable-RemoveLicenses.ps1"
 if (-not $NoSelfUpdate -and -not $Updated) {
     $relArg = if ($Relaunched) { ' -Relaunched' } else { '' }
@@ -115,7 +125,7 @@ if (-not $NoSelfUpdate -and -not $Updated) {
             # --- Plain download (no git): detect new commit via GitHub API, then fetch & replace ---
             Write-Host "Checking GitHub for the latest version..." -ForegroundColor Gray
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            $hdr = @{ 'User-Agent' = 'LeaverCleanupTool'; 'Accept' = 'application/vnd.github+json' }
+            $hdr = @{ 'User-Agent' = 'Sherborne-Leaver-Cleanup-Tool'; 'Accept' = 'application/vnd.github+json' }
             $remoteSha = (Invoke-RestMethod -Uri "https://api.github.com/repos/$($script:Owner)/$($script:Repo)/commits/main" -Headers $hdr -TimeoutSec 15 -ErrorAction Stop).sha
             $stateFile = Join-Path $PSScriptRoot 'LeaverTool.update-state'
             $storedSha = if (Test-Path $stateFile) { (Get-Content -Raw -LiteralPath $stateFile -ErrorAction SilentlyContinue).Trim() } else { '' }

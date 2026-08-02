@@ -3,7 +3,7 @@
     One-liner launcher for the Microsoft 365 Leaver Cleanup Tool.
 
 .DESCRIPTION
-    Installs the tool into a PERMANENT folder (Desktop\LeaverCleanupTool) and
+    Installs the tool into a PERMANENT folder (Desktop\Sherborne-Leaver-Cleanup-Tool) and
     launches it there. A permanent folder is used on purpose: this tool creates
     undo files (Restore_*.json), audit logs, and a config file that MUST persist
     between runs — running from a temporary folder would lose your safety net.
@@ -23,7 +23,7 @@ $repoRaw    = "https://raw.githubusercontent.com/xnostra/Sherborne-Leaver-Cleanu
 $scriptUrl  = "$repoRaw/Disable-RemoveLicenses.ps1"
 
 # Permanent install folder so undo files, logs, and config persist
-$installDir = Join-Path ([Environment]::GetFolderPath('Desktop')) "LeaverCleanupTool"
+$installDir = Join-Path ([Environment]::GetFolderPath('Desktop')) "Sherborne-Leaver-Cleanup-Tool"
 $scriptPath = Join-Path $installDir "Disable-RemoveLicenses.ps1"
 
 Write-Host "Microsoft 365 Leaver Cleanup Tool" -ForegroundColor Cyan
