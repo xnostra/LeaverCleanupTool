@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   All-in-one leaver cleanup tool for Microsoft 365.
   Disables accounts, removes licenses, removes group/distribution list/Teams memberships,
@@ -47,22 +47,36 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if ($isAdmin -and -not $Relaunched) {
     Write-Host "Running as administrator - relaunching as your normal user so Microsoft sign-in works..." -ForegroundColor Yellow
     $ok = $false
+    $psExe = Join-Path $PSHOME 'powershell.exe'
+    $scr   = $PSCommandPath
+    $arg   = "-NoProfile -STA -ExecutionPolicy Bypass -File `"$scr`" -Relaunched"
     try {
-        $psExe   = Join-Path $PSHOME 'powershell.exe'
-        $scr     = $PSCommandPath
-        $me      = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        $arg     = "-NoProfile -STA -ExecutionPolicy Bypass -File `"$scr`" -Relaunched"
-        $action  = New-ScheduledTaskAction -Execute $psExe -Argument $arg -WorkingDirectory (Split-Path $scr)
-        $princ   = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
-        $task    = New-ScheduledTask -Action $action -Principal $princ
-        $tn      = 'LeaverCleanup_RunAsUser'
-        Register-ScheduledTask -TaskName $tn -InputObject $task -Force -ErrorAction Stop | Out-Null
-        Start-ScheduledTask -TaskName $tn -ErrorAction Stop
-        Start-Sleep -Seconds 2
-        Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+        # Use the Shell COM object's ShellExecute to launch the process. Even called from an
+        # elevated process, this routes through the desktop's own (non-elevated) shell, so the
+        # launched process inherits normal/medium integrity - not admin. Far more reliable than a
+        # Scheduled Task, which can be silently blocked by policy on managed devices (fails with no
+        # error and no window at all, which is exactly what happened here).
+        $shellApp = New-Object -ComObject "Shell.Application"
+        $shellApp.ShellExecute($psExe, $arg, (Split-Path $scr), 'open', 1)
+        [void][Runtime.Interopservices.Marshal]::ReleaseComObject($shellApp)
         $ok = $true
     } catch {
-        Write-Host "Automatic relaunch failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Automatic relaunch via Shell COM failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Falling back to a Scheduled Task..." -ForegroundColor Yellow
+        try {
+            $me      = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $action  = New-ScheduledTaskAction -Execute $psExe -Argument $arg -WorkingDirectory (Split-Path $scr)
+            $princ   = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
+            $task    = New-ScheduledTask -Action $action -Principal $princ
+            $tn      = 'LeaverCleanup_RunAsUser'
+            Register-ScheduledTask -TaskName $tn -InputObject $task -Force -ErrorAction Stop | Out-Null
+            Start-ScheduledTask -TaskName $tn -ErrorAction Stop
+            Start-Sleep -Seconds 2
+            Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+            $ok = $true
+        } catch {
+            Write-Host "Scheduled Task fallback also failed: $($_.Exception.Message)" -ForegroundColor Red
+        }
     }
     if ($ok) {
         Write-Host "A new window is opening as your normal user - this admin window will close by itself..." -ForegroundColor Green
@@ -857,6 +871,23 @@ function Invoke-AccountCleanup {
     Write-Host "    - disabling account (cloud)..." -ForegroundColor Gray
     try { Update-MgUser -UserId $User.Id -AccountEnabled:$false -ErrorAction Stop; $done += if ($isSynced) { 'disabled in cloud (will re-sync unless also disabled in local AD)' } else { 'disabled' } }
     catch { $done += "could not disable in cloud ($($_.Exception.Message)) - disable in local AD instead" }
+
+    # Tags the account as a leaver via a directory schema extension attribute (the same
+    # mechanism School Data Sync uses for Education_ObjectType) so the "All Users" dynamic
+    # group rule can exclude it - see Setup-LeaverTag.ps1.
+    # Uses extensionAttribute15 (built-in, no app registration needed) instead of a custom directory
+    # schema extension - Graph only lets the OWNING app write custom schema extension values using its
+    # own app credentials, which blocked this when called via delegated Microsoft Graph PowerShell auth.
+    try {
+        $tagBody = @{ onPremisesExtensionAttributes = @{ extensionAttribute15 = "Leaver" } } | ConvertTo-Json
+        Invoke-MgGraphRequest -Method PATCH -Uri "https://graph.microsoft.com/v1.0/users/$($User.Id)" -Body $tagBody -ContentType "application/json" -ErrorAction Stop
+        $done += "tagged as leaver (extensionAttribute15) so it drops out of dynamic groups scoped to that tag (e.g. All Users)"
+    } catch {
+        $tagErrDetail = $_.Exception.Message
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $tagErrDetail = $_.ErrorDetails.Message }
+        Write-Log "LEAVER TAG FAILED for $($User.UserPrincipalName): $tagErrDetail"
+        $done += "could not set leaver tag ($tagErrDetail)$(if ($isSynced) { ' - this account is synced from local AD, which usually owns extensionAttribute15; set it there instead if needed' })"
+    }
 
     if ($ConvertToShared) {
         try {
@@ -1653,3 +1684,4 @@ else {
         elseif ($choice -eq 4) { Start-PurgeMode }
     }
 }
+
